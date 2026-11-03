@@ -2,6 +2,18 @@
 
 ## 未发布
 
+### Added
+
+- **接口协议可切换（SystemOne / OpenAI Decisions）**：新增配置项 `api_format`。
+  `systemone`（默认）打 `POST {base_url}/v1/systemone`——官方 Jev / TypeSafe /
+  StartLux 的 SystemOne 通道都走这个；`decisions` 打 `POST {base_url}/v1/decisions`
+  ——OpenAI 新出的 Decisions 协议，部分中转站用的是这个端点。两者请求体结构不同
+  （SystemOne 是 `state` + `questions` 映射，Decisions 是 `input` + `questions` 数组，
+  是非题在 Decisions 里叫 `predicate`、候选项从 `criteria` 映射变成 `choices` 数组），
+  插件在传输层自动双向翻译：**判定层一行都不用改**，内部始终是 SystemOne 的形状。
+  老配置不填就是 systemone，行为不变。`core/jev_transport.py`、`_conf_schema.json`、
+  `scripts/probe_jev.py`（新增 `--api-format`）、`tests/test_jev_api_formats.py`。
+
 ### Fixed
 
 - **Jev 网关返回 500 时能看懂、能重试**：中转网关在「上游任务失败」时经常返回 500
