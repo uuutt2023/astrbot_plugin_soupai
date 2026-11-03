@@ -3,20 +3,20 @@
     "description": "生成谜题的 LLM 服务商",
     "type": "string",
     "_special": "select_provider",
-    "hint": "从下拉列表中选择用于生成海龟汤谜题的 LLM 服务商（列表来自 AstrBot 已配置的对话模型）。留空则使用系统默认的 LLM 服务商。建议使用智力大于等于DeepSeek0-V2 R1的模型。",
+    "hint": "从下拉列表选择生成谜题用的 LLM 服务商；留空用系统默认。建议智力 ≥ DeepSeek-V2-R1。",
     "default": ""
   },
   "judge_llm_provider": {
     "description": "判断问答和生成提示的 LLM 服务商",
     "type": "string",
     "_special": "select_provider",
-    "hint": "从下拉列表中选择用于判断用户问答和生成提示的 LLM 服务商（列表来自 AstrBot 已配置的对话模型）。留空则使用系统默认的 LLM 服务商。不建议使用reasoning模型",
+    "hint": "从下拉列表选择判断问答与生成提示用的 LLM 服务商；留空用系统默认。不建议用 reasoning 模型。",
     "default": ""
   },
   "judge_backend": {
     "description": "判断问答的后端",
     "type": "string",
-    "hint": "玩家每次提问都要判断一次该回「是/否/是也不是/不重要」。llm＝用 LLM 生成并解析（默认，行为与原来完全一致）；jev＝用 Jev 决策模型做类型化判断，不生成文字，只对输入 token 计费；hybrid＝先用 Jev 判断，置信度不足时再回退 LLM，省 token。",
+    "hint": "llm＝调用 LLM 判断（默认）；jev＝只用 Jev 决策模型；hybrid＝Jev 先判，把握不足再回落 LLM。",
     "options": [
       "llm",
       "jev",
@@ -26,11 +26,6 @@
       "LLM 判断（默认）",
       "Jev 决策模型",
       "Jev 优先 + LLM 兜底"
-    ],
-    "subtitles": [
-      "维持原样：调用 LLM 生成判断并解析它，行为与接入 Jev 之前完全一致。",
-      "只用 Jev 决策模型判断，不调用大模型；更快也更便宜（Jev 只对输入 token 计费，输出免费），但需要自备 Jev API Key。",
-      "先用 Jev 判断，Jev 把握不大时才调用 LLM 复核；Jev 越不确定，调用 LLM 的频率越高。"
     ],
     "default": "llm"
   },
@@ -73,30 +68,30 @@
   "jev_judge": {
     "type": "object",
     "description": "[Jev 判断] Jev 决策模型设置",
-    "hint": "仅在「判断问答的后端」选择 jev 或 hybrid 时生效。Jev 只对输入 token 计费、输出免费；上游失败不计费，可安全重试。未启用或调用失败时一律回退 LLM，游戏不会中断。",
+    "hint": "仅在「判断问答的后端」选 jev/hybrid 时生效。",
     "items": {
       "enabled": {
         "type": "bool",
         "description": "启用 Jev 判断",
-        "hint": "总开关。关闭时即使后端选了 jev/hybrid 也只走 LLM。",
+        "hint": "总开关，关闭时只走 LLM。",
         "default": false
       },
       "api_key": {
         "type": "string",
         "description": "Jev API Key",
-        "hint": "在所选网关的控制台创建，sk- 开头：jevmodel.org 控制台「API keys」（https://jevmodel.org/zh/docs/），或 TypeSafe（https://console.typesafe.ai）。Key 必须与接口地址属于同一个网关。",
+        "hint": "sk- 开头，在所选网关的控制台创建。",
         "default": ""
       },
       "base_url": {
         "type": "string",
         "description": "Jev 接口地址",
-        "hint": "网关根地址，实际请求路径由「接口协议」决定：systemone 走 {base_url}/v1/systemone，decisions 走 {base_url}/v1/decisions。常见网关：https://jevmodel.org（文档见 https://jevmodel.org/zh/docs/）、https://api.typesafe.ai，或中转站的自有域名。",
+        "hint": "网关根地址，请求路径由「接口协议」决定。",
         "default": "https://jevmodel.org"
       },
       "api_format": {
         "type": "string",
         "description": "接口协议",
-        "hint": "决定请求体与端点路径。systemone＝TypeSafe SystemOne 协议（jevmodel.org / api.typesafe.ai / StartLux，默认）；decisions＝OpenAI Decisions 协议（POST /v1/decisions，部分中转站用这个端点）。两者结构不同，插件内部会自动翻译，判定逻辑不用改。",
+        "hint": "systemone＝官方 Jev/TypeSafe；decisions＝OpenAI Decisions。部分中转站用后者。",
         "options": [
           "systemone",
           "decisions"
@@ -105,34 +100,30 @@
           "SystemOne（/v1/systemone）",
           "OpenAI Decisions（/v1/decisions）"
         ],
-        "subtitles": [
-          "官方 Jev / TypeSafe 协议：state + questions 映射。jevmodel.org、api.typesafe.ai、StartLux 的 SystemOne 通道都走这个。",
-          "OpenAI 新出的 Decisions 协议：input + questions 数组。若你的中转站文档写的是 /v1/decisions，选这个。"
-        ],
         "default": "systemone"
       },
       "model": {
         "type": "string",
         "description": "Jev 模型名",
-        "hint": "默认 jev-latest；jev-preview 支持图像输入与 Box 定位（实验性）。",
+        "hint": "默认 jev-latest；jev-preview 支持图像输入（实验性）。",
         "default": "jev-latest"
       },
       "timeout_sec": {
         "type": "float",
         "description": "请求超时（秒）",
-        "hint": "本轮全部尝试共享的总预算，同时也是等待上限。单次 Jev 调用通常需要 2-4 秒，预算低于 5 秒会一直超时。建议 5-10 秒。",
+        "hint": "本轮所有尝试共享的总预算，建议 5-10 秒。",
         "default": 8.0
       },
       "retries": {
         "type": "int",
         "description": "失败重试次数",
-        "hint": "限流／上游故障（429/502/409）重试次数，退避等待装不进本轮预算时放弃。",
+        "hint": "限流或上游故障时重试。",
         "default": 1
       },
       "gate_mode": {
         "type": "string",
         "description": "置信度门控方式",
-        "hint": "决定「什么时候才采信 Jev 的判断」。threshold＝Jev 对自己这一档的把握达到阈值才采信，否则回退 LLM（默认，行为可复现、成本可预期）；sample＝以把握概率 p 采信 Jev，否则回退 LLM——Jev 越没把握，调用 LLM 的频率越高，成本随不确定性平滑上升。",
+        "hint": "threshold＝达到阈值才采信 Jev；sample＝按把握概率抽样采信。",
         "options": [
           "threshold",
           "sample"
@@ -141,55 +132,46 @@
           "按阈值（可复现）",
           "按概率抽样（平滑）"
         ],
-        "subtitles": [
-          "Jev 对自己这一档的把握达到阈值才采信，否则回退 LLM；同样的输入永远得到同样的处理，LLM 调用次数可预期。",
-          "以 Jev 给出的把握概率 p 采信 Jev，否则回退 LLM；LLM 调用频率随 Jev 的不确定性线性上升，抽样值会写进日志。"
-        ],
         "default": "threshold"
       },
       "prompt_language": {
         "type": "string",
         "description": "提示词语言",
-        "hint": "auto＝按题目内容自动判断（中文题目用中文 criteria，英文题目用英文）；zh＝固定用中文；en＝固定用英文。选项标签与玩家看到的保持一致时，判定最稳。",
+        "hint": "auto＝跟随内容语言；zh/en＝固定。",
         "options": [
           "auto",
           "zh",
           "en"
         ],
         "labels": [
-          "自动（跟随题目语言）",
+          "自动（跟随内容语言）",
           "固定中文",
           "固定英文"
-        ],
-        "subtitles": [
-          "题目里有中文就用中文 criteria，否则用英文——这是多数情况下的最优解。",
-          "始终用中文 criteria 与中文选项（是 / 否 / 是也不是 / 不重要）。",
-          "始终用英文 criteria 与英文选项（yes / no / partial / irrelevant），显示时再映射回中文。"
         ],
         "default": "auto"
       },
       "show_relevance": {
         "type": "bool",
         "description": "显示相关性百分比",
-        "hint": "开启后，Jev 的判断结果会附带相关性百分比，例如「是（3/10，相关性 88%）」。百分比就是 Jev 对该判定的把握（概率），用来提示玩家这次提问问得有多准；走 LLM 判断时没有概率，不显示。问答历史里仍然只记干净的「是/否」，百分比只出现在回复里。",
+        "hint": "Jev 判定附带把握百分比；走 LLM 时没有。",
         "default": true
       },
       "min_confidence": {
         "type": "float",
         "description": "采信阈值",
-        "hint": "threshold 模式下：Jev 选中的那一档概率达到该值才采信，否则回退 LLM。默认值：0.6。sample 模式下这个值不参与判定，只在界面上留作参考。",
+        "hint": "threshold 模式下：Jev 选中那档的概率达到该值才采信。",
         "default": 0.6
       },
       "max_state_chars": {
         "type": "int",
         "description": "发送上下文长度上限",
-        "hint": "发送给 Jev 的上下文（题面 + 完整真相 + 最近几轮问答 + 玩家提问）字符数上限，超出时从最旧的历史问答开始丢。默认值：1200。",
+        "hint": "超出部分从最旧的内容开始丢。",
         "default": 1200
       },
       "history_rounds": {
         "type": "int",
         "description": "带入的历史轮数",
-        "hint": "最多带入最近几轮问答供 Jev 参考（判断「不重要」时用得上）。超出长度上限时优先丢最旧的。默认值：6。",
+        "hint": "最多带入最近几轮问答供 Jev 参考。",
         "default": 6
       }
     }
