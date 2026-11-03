@@ -56,9 +56,10 @@ class TestBackendDispatch:
         plugin = make_plugin({"judge_backend": "llm"})
         plugin.jev_client = FakeJevClient(jev_ready())
 
-        reply = await plugin.judge_question("死者是不是男的", "他是男性")
+        outcome = await plugin.judge_question("死者是不是男的", "他是男性")
 
-        assert reply == "是"
+        assert outcome.verdict == "是"
+        assert outcome.source == "llm"
         assert plugin.jev_client.calls == []
         assert len(plugin._test_provider_calls) == 1
 
@@ -67,9 +68,11 @@ class TestBackendDispatch:
         plugin = make_plugin(JEV_CONFIG)
         plugin.jev_client = FakeJevClient(jev_ready(choice="no"))
 
-        reply = await plugin.judge_question("死者是不是男的", "他是男性")
+        outcome = await plugin.judge_question("死者是不是男的", "他是男性")
 
-        assert reply == "否"
+        assert outcome.verdict == "否"
+        assert outcome.source == "jev"
+        assert outcome.confidence == pytest.approx(0.93)
         assert len(plugin.jev_client.calls) == 1
         assert plugin._test_provider_calls == []
 
@@ -79,9 +82,10 @@ class TestBackendDispatch:
         plugin = make_plugin(config)
         plugin.jev_client = FakeJevClient(jev_ready())
 
-        reply = await plugin.judge_question("死者是不是男的", "他是男性")
+        outcome = await plugin.judge_question("死者是不是男的", "他是男性")
 
-        assert reply == "是"  # LLM 的答案
+        assert outcome.verdict == "是"  # LLM 的答案
+        assert outcome.source == "llm"
         assert plugin.jev_client.calls == []
         assert len(plugin._test_provider_calls) == 1
 
@@ -90,9 +94,10 @@ class TestBackendDispatch:
         plugin = make_plugin(JEV_CONFIG)
         plugin.jev_client = FakeJevClient({"status": "upstream_error"})
 
-        reply = await plugin.judge_question("死者是不是男的", "他是男性")
+        outcome = await plugin.judge_question("死者是不是男的", "他是男性")
 
-        assert reply == "是"
+        assert outcome.verdict == "是"
+        assert outcome.source == "llm"
         assert len(plugin._test_provider_calls) == 1
 
     @pytest.mark.asyncio
@@ -104,9 +109,10 @@ class TestBackendDispatch:
         plugin = make_plugin(JEV_CONFIG)
         plugin.jev_client = ExplodingClient()
 
-        reply = await plugin.judge_question("死者是不是男的", "他是男性")
+        outcome = await plugin.judge_question("死者是不是男的", "他是男性")
 
-        assert reply == "是"
+        assert outcome.verdict == "是"
+        assert outcome.source == "llm"
         assert len(plugin._test_provider_calls) == 1
 
     @pytest.mark.asyncio
@@ -115,9 +121,10 @@ class TestBackendDispatch:
         plugin = make_plugin(config)
         plugin.jev_client = FakeJevClient(jev_ready(choice="partial"))
 
-        reply = await plugin.judge_question("死者是不是男的", "他是男性")
+        outcome = await plugin.judge_question("死者是不是男的", "他是男性")
 
-        assert reply == "是也不是"
+        assert outcome.verdict == "是也不是"
+        assert outcome.source == "jev"
         assert plugin._test_provider_calls == []
 
     @pytest.mark.asyncio
@@ -126,9 +133,10 @@ class TestBackendDispatch:
         plugin = make_plugin(config)
         plugin.jev_client = FakeJevClient(jev_ready(confidence=0.2))
 
-        reply = await plugin.judge_question("死者是不是男的", "他是男性")
+        outcome = await plugin.judge_question("死者是不是男的", "是男性")
 
-        assert reply == "是"  # LLM 的答案
+        assert outcome.verdict == "是"  # LLM 的答案
+        assert outcome.source == "llm"
         assert len(plugin.jev_client.calls) == 1
         assert len(plugin._test_provider_calls) == 1
 
@@ -137,9 +145,10 @@ class TestBackendDispatch:
         plugin = make_plugin({"judge_backend": "nonexistent"})
         plugin.jev_client = FakeJevClient(jev_ready())
 
-        reply = await plugin.judge_question("死者是不是男的", "他是男性")
+        outcome = await plugin.judge_question("死者是不是男的", "他是男性")
 
-        assert reply == "是"
+        assert outcome.verdict == "是"
+        assert outcome.source == "llm"
         assert plugin.jev_client.calls == []
         assert len(plugin._test_provider_calls) == 1
 
@@ -176,3 +185,61 @@ class TestTerminate:
         await plugin.terminate()
 
         assert closed == [True]
+
+
+class TestRelevanceDisplay:
+    """相关性百分比的显示逻辑。"""
+
+    def test_relevance_text_from_jev(self, plugin_module):
+        result = plugin_module.JudgeResult("是", confidence=0.88, source="jev")
+        assert result.relevance_text() == "相关性 88%"
+
+    def test_llm_result_has_no_relevance(self, plugin_module):
+        result = plugin_module.JudgeResult("是", confidence=0.0, source="llm")
+        assert result.relevance_text() == ""
+        assert result.display("", True) == "是"
+
+    def test_jev_result_without_probability_has_no_relevance(self, plugin_module):
+        result = plugin_module.JudgeResult("是", confidence=0.0, source="jev")
+        assert result.relevance_text() == ""
+
+    def test_display_with_count(self, plugin_module):
+        result = plugin_module.JudgeResult("否", confidence=0.884, source="jev")
+        assert result.display("3/10", True) == "否（3/10，相关性 88%）"
+
+    def test_display_without_count(self, plugin_module):
+        result = plugin_module.JudgeResult("否", confidence=0.884, source="jev")
+        assert result.display("", True) == "否（相关性 88%）"
+
+    def test_display_switch_off(self, plugin_module):
+        result = plugin_module.JudgeResult("否", confidence=0.884, source="jev")
+        assert result.display("3/10", False) == "否（3/10）"
+        assert result.display("", False) == "否"
+
+    def test_tiny_probability_is_not_rounded_to_zero(self, plugin_module):
+        result = plugin_module.JudgeResult("是", confidence=0.004, source="jev")
+        assert result.relevance_text() == "相关性 <1%"
+
+    def test_probability_rounding(self, plugin_module):
+        assert plugin_module.JudgeResult("是", 0.659, "jev").relevance_text() == "相关性 66%"
+        assert plugin_module.JudgeResult("是", 0.999, "jev").relevance_text() == "相关性 100%"
+        assert plugin_module.JudgeResult("是", 0.1, "jev").relevance_text() == "相关性 10%"
+
+    @pytest.mark.asyncio
+    async def test_plugin_switch_reads_config(self, make_plugin):
+        plugin = make_plugin({**JEV_CONFIG, "jev_judge": {**JEV_CONFIG["jev_judge"], "show_relevance": False}})
+        assert plugin.show_relevance is False
+        plugin = make_plugin({**JEV_CONFIG, "jev_judge": {**JEV_CONFIG["jev_judge"], "show_relevance": True}})
+        assert plugin.show_relevance is True
+        # 老配置没有这个键时默认开启
+        plugin = make_plugin(JEV_CONFIG)
+        assert plugin.show_relevance is True
+
+    @pytest.mark.asyncio
+    async def test_judged_result_carries_confidence(self, make_plugin):
+        plugin = make_plugin(JEV_CONFIG)
+        plugin.jev_client = FakeJevClient(jev_ready(choice="no", confidence=0.88))
+        outcome = await plugin.judge_question("死者是不是男的", "他是男性")
+        assert outcome.verdict == "否"
+        assert outcome.confidence == pytest.approx(0.88)
+        assert outcome.display("3/10", True) == "否（3/10，相关性 88%）"

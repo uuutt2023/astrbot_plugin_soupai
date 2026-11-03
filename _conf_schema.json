@@ -129,6 +129,12 @@
         ],
         "default": "threshold"
       },
+      "show_relevance": {
+        "type": "bool",
+        "description": "显示相关性百分比",
+        "hint": "开启后，Jev 的判断结果会附带相关性百分比，例如「是（3/10，相关性 88%）」。百分比就是 Jev 对该判定的把握（概率），用来提示玩家这次提问问得有多准；走 LLM 判断时没有概率，不显示。问答历史里仍然只记干净的「是/否」，百分比只出现在回复里。",
+        "default": true
+      },
       "min_confidence": {
         "type": "float",
         "description": "采信阈值",

@@ -432,6 +432,46 @@ class VerificationResult:
         }
 
 
+class JudgeResult:
+    """一次问答判断的结果。
+
+    - ``verdict``：干净的判定（是 / 否 / 是也不是 / 不重要），问答历史存这个；
+    - ``confidence``：Jev 对该判定的把握（0 表示来自 LLM，LLM 不给概率）；
+    - ``source``：判定来源（``llm`` / ``jev``）。
+
+    拆开存是为了让「历史里的判定」保持干净，而「发给玩家的文本」可以按开关
+    附带相关性百分比——百分比只是提示，不该污染历史和后续提示词。
+    """
+
+    def __init__(self, verdict: str, confidence: float = 0.0, source: str = "llm"):
+        self.verdict = verdict
+        self.confidence = confidence
+        self.source = source
+
+    def relevance_text(self) -> str:
+        """相关性百分比文本，例如「相关性 88%」；LLM 判定或概率缺失时为空串。"""
+        if self.source != "jev" or self.confidence <= 0:
+            return ""
+        percent = self.confidence * 100
+        # 概率极小时四舍五入会变成 0%，那会误导人，直接写 <1%
+        text = "<1%" if percent < 1 else f"{percent:.0f}%"
+        return f"相关性 {text}"
+
+    def display(self, count_text: str = "", show_relevance: bool = False) -> str:
+        """最终发给玩家的文本。
+
+        有提问计数时把计数与相关性放进同一组括号：「是（3/10，相关性 88%）」；
+        没有计数时：「是（相关性 88%）」。
+        """
+        relevance = self.relevance_text() if show_relevance else ""
+        if count_text:
+            inner = count_text + (f"，{relevance}" if relevance else "")
+            return f"{self.verdict}（{inner}）"
+        if relevance:
+            return f"{self.verdict}（{relevance}）"
+        return self.verdict
+
+
 # 自定义会话过滤器 - 以群为单位进行会话控制
 class GroupSessionFilter(SessionFilter):
     """会话过滤器，确保每个群的会话独立"""
@@ -523,6 +563,11 @@ class SoupaiPlugin(Star):
         # 自动生成状态
         self.auto_generating = False
         self.auto_generate_task = None
+
+    @property
+    def show_relevance(self) -> bool:
+        """是否在判断结果后附带相关性百分比（Jev 判定时才有概率）。"""
+        return bool(self.jev_judge_config.get("show_relevance", True))
 
     def _ensure_story_storages(self) -> None:
         """确保题库存储被初始化。
@@ -981,7 +1026,7 @@ class SoupaiPlugin(Star):
         true_answer: str,
         puzzle: str = "",
         qa_history: Optional[List[Dict[str, str]]] = None,
-    ) -> str:
+    ) -> JudgeResult:
         """判断玩家提问的回答方式：是 / 否 / 是也不是 / 不重要。
 
         按 ``judge_backend`` 分发：
@@ -993,12 +1038,14 @@ class SoupaiPlugin(Star):
         Jev 永远不能把游戏搞坏：Jev 侧任何异常都会回落到 LLM。
         """
         if self.judge_backend in (JUDGE_BACKEND_JEV, JUDGE_BACKEND_HYBRID):
-            verdict = await self._judge_via_jev(
+            judged = await self._judge_via_jev(
                 question, true_answer, puzzle, qa_history
             )
-            if verdict:
-                return verdict
-        return await self._judge_with_llm(question, true_answer)
+            if judged is not None:
+                return judged
+        return JudgeResult(
+            await self._judge_with_llm(question, true_answer), source="llm"
+        )
 
     async def _judge_via_jev(
         self,
@@ -1006,12 +1053,12 @@ class SoupaiPlugin(Star):
         true_answer: str,
         puzzle: str = "",
         qa_history: Optional[List[Dict[str, str]]] = None,
-    ) -> str:
-        """用 Jev 判断玩家提问，返回四档之一；不可用时返回空串（调用方回退 LLM）。"""
+    ) -> Optional[JudgeResult]:
+        """用 Jev 判断玩家提问；不可用时返回 None（调用方回退 LLM）。"""
         cfg = self.jev_judge_config
         if not cfg.get("enabled"):
             logger.info("Jev 判断未启用，使用 LLM 判断")
-            return ""
+            return None
         try:
             result = await jev_judge.judge_via_jev(
                 self.jev_client,
@@ -1027,18 +1074,22 @@ class SoupaiPlugin(Star):
             )
         except Exception as e:
             logger.error(f"Jev 判断异常，回退 LLM: {e}")
-            return ""
+            return None
 
         if not result.get("ok"):
             logger.warning(
                 f"Jev 未给出可用判定（{result.get('reason', '未知')}），回退 LLM"
             )
-            return ""
+            return None
         logger.info(
             f"Jev 判定: {result.get('verdict')} "
             f"置信度 {result.get('confidence', 0.0):.3f}"
         )
-        return str(result.get("verdict") or "")
+        return JudgeResult(
+            str(result.get("verdict") or ""),
+            confidence=float(result.get("confidence") or 0.0),
+            source="jev",
+        )
 
     async def _judge_with_llm(self, question: str, true_answer: str) -> str:
         """使用 LLM 判断用户提问的回答方式"""
@@ -1550,12 +1601,14 @@ class SoupaiPlugin(Star):
 
                     # 判断回答（是否问答）：按 judge_backend 走 LLM 或 Jev
                     logger.info(f"使用 {self.judge_backend} 判断游戏问答: '{command_part}'")
-                    reply = await self.judge_question(
+                    outcome = await self.judge_question(
                         command_part,
                         current_answer,
                         puzzle=(game or {}).get("puzzle", ""),
                         qa_history=(game or {}).get("qa_history", []),
                     )
+                    # 问答历史存干净的判定；相关性百分比只出现在给玩家的消息里
+                    reply = outcome.verdict
 
                     # 记录提问和回答
                     if game is not None:
@@ -1565,9 +1618,10 @@ class SoupaiPlugin(Star):
                     # 更新问题计数
                     if question_limit is not None and game is not None:
                         game["question_count"] = game.get("question_count", 0) + 1
-                        # 将判断结果和使用次数合并到一条消息中
-                        combined_reply = (
-                            f"{reply}（{game['question_count']}/{question_limit}）"
+                        # 将判断结果、使用次数（和可选的相关性百分比）合并到一条消息中
+                        combined_reply = outcome.display(
+                            f"{game['question_count']}/{question_limit}",
+                            self.show_relevance,
                         )
                         await event.send(event.plain_result(combined_reply))
 
@@ -1579,7 +1633,9 @@ class SoupaiPlugin(Star):
                             )
                     else:
                         # 如果没有问题限制，只发送判断结果
-                        await event.send(event.plain_result(reply))
+                        await event.send(
+                            event.plain_result(outcome.display("", self.show_relevance))
+                        )
 
                     # 重置超时时间
                     controller.keep(timeout=self.game_timeout, reset_timeout=True)
