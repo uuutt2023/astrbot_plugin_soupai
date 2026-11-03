@@ -19,7 +19,7 @@ class FakeJevClient:
 
 def jev_ready(choice="yes", confidence=0.93):
     # 概率质量要落在被选中的那一档上——传输层就是这么返回的
-    probabilities = {key: 0.0 for key in ("yes", "no", "partial", "irrelevant")}
+    probabilities = {key: 0.0 for key in ("是", "否", "无关")}
     probabilities[choice] = confidence
     return {
         "status": "ready",
@@ -119,11 +119,11 @@ class TestBackendDispatch:
     async def test_hybrid_uses_jev_when_confident(self, make_plugin):
         config = {**JEV_CONFIG, "judge_backend": "hybrid"}
         plugin = make_plugin(config)
-        plugin.jev_client = FakeJevClient(jev_ready(choice="partial"))
+        plugin.jev_client = FakeJevClient(jev_ready(choice="无关"))
 
         outcome = await plugin.judge_question("死者是不是男的", "他是男性")
 
-        assert outcome.verdict == "是也不是"
+        assert outcome.verdict == "无关"
         assert outcome.source == "jev"
         assert plugin._test_provider_calls == []
 

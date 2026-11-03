@@ -100,27 +100,34 @@ Jev 文档明确 `state` 可以是 `string / object / array`，这里用对象�
 ```json
 {"verdict": {
   "type": "choice",
-  "instructions": "这是一个海龟汤（情境推理）游戏。你是主持人……",
+  "instructions": "这是一个海龟汤（情境推理）游戏。你是主持人……（判定步骤）",
   "criteria": {
-    "是":        "玩家说对了：……",
-    "否":        "玩家说错了：……",
-    "是也不是": "说对了一半：……",
-    "不重要":   "与真相无关：……"
+    "是":   "玩家问的事实或合理推论被真相支持。",
+    "否":   "真相明确排除了这个事实，答「是」会误导玩家时才用；真相只是没提到，不算「否」。",
+    "无关": "真相既没提到也没排除这个事实，或玩家问的根本不是关于这个故事的是非题。"
   }
 }}
 ```
 
 - 一次请求 1 道题（文档上限 8 道）。
 - `criteria` 为 `{key: description}` 字典，`key` 即返回的 `answers.verdict.choice`。
-- **选项标签就是玩家看到的那四个字**，Jev 返回什么就显示什么，不做中间映射。
+- **只有三档：是 / 否 / 无关**（对齐 Situation-Puzzle）。原先的「是也不是」去掉：
+  三档下「说对一半」的提问不再是第四个选项，而是**置信度不足**——分布摊在
+  「是」和「否」之间，被置信度门控拦下交回 LLM 复核。
+- **选项标签就是玩家看到的那三个字**，Jev 返回什么就显示什么，不做中间映射。
 - 返回：`{"type":"choice","choice":"否","probabilities":{...},"confidence":0.93}`。
 - 提示词**跟随题目语言**：中文题目用中文 criteria，英文题目用英文
-  （`yes / no / partial / irrelevant`），可用 `prompt_language` 固定口径。
+  （`yes / no / irrelevant`），可用 `prompt_language` 固定口径。
+- **判定程序写进 instructions**（参考 jev-turtle-soup）：
+  先在真相里找事实 → 找到（哪怕顺带提到、或明确排除）就答 是/否 → 真相**明确排除**
+  才答 否 → 真相**完全沉默**才答 无关；历史问答只用于消解指代，不能当证据。
 - **缺概率是协议错误**：不默认为 0，直接回退 LLM。
+- 约束：`instructions` ≤ 1800 字符、criteria 序列化后 ≤ 2000 字符（文档上限，
+  两者都有测试守着）。
 
 ### 4.3 提示词版本
 
-`core/jev_judge.PROMPT_VERSION`（当前 `v1-2026-11-soupai`）。改 instructions /
+`core/jev_judge.PROMPT_VERSION`（当前 `v2-2026-11-soupai`）。改 instructions /
 criteria / state 结构必须同时升版本，日志与 `/汤配置` 会显示当次用的哪套，
 配合 `scripts/eval_judgment.py` 做回归。
 

@@ -27,20 +27,20 @@ class TestQuestions:
         question = questions[jev_judge.QUESTION_NAME]
         assert question["type"] == "choice"
         assert question["instructions"].strip()
-        assert len(question["criteria"]) == 4
+        assert len(question["criteria"]) == 3
 
     def test_chinese_criteria_keys_are_display_labels(self):
         """中文 criteria 的选项键就是玩家看到的那四个字，省掉一层映射。"""
         criteria = jev_judge.build_questions(jev_judge.LANG_ZH)[
             jev_judge.QUESTION_NAME
         ]["criteria"]
-        assert set(criteria) == {"是", "否", "是也不是", "不重要"}
+        assert set(criteria) == {"是", "否", "无关"}
 
     def test_english_criteria_keys(self):
         criteria = jev_judge.build_questions(jev_judge.LANG_EN)[
             jev_judge.QUESTION_NAME
         ]["criteria"]
-        assert set(criteria) == {"yes", "no", "partial", "irrelevant"}
+        assert set(criteria) == {"yes", "no", "irrelevant"}
 
     def test_criteria_language_matches_request(self):
         zh = jev_judge.build_questions(jev_judge.LANG_ZH)[jev_judge.QUESTION_NAME]
@@ -190,9 +190,9 @@ class TestVerdictConfidence:
 
     def test_english_choice_is_mapped_to_canonical(self):
         verdict, confidence = jev_judge.verdict_confidence(
-            {"type": "choice", "choice": "partial", "probabilities": {"partial": 0.7}}
+            {"type": "choice", "choice": "irrelevant", "probabilities": {"irrelevant": 0.7}}
         )
-        assert verdict == jev_judge.VERDICT_PARTIAL
+        assert verdict == jev_judge.VERDICT_IRRELEVANT
         assert confidence == pytest.approx(0.7)
 
     def test_unknown_choice_is_rejected(self):
@@ -247,7 +247,7 @@ class TestPickVerdict:
             "confidence": confidence,
             "probabilities": {
                 k: (confidence if k == key else 0.0)
-                for k in ("是", "否", "是也不是", "不重要")
+                for k in ("是", "否", "无关")
             },
         }
 
@@ -256,8 +256,7 @@ class TestPickVerdict:
         [
             ("是", "是"),
             ("否", "否"),
-            ("是也不是", "是也不是"),
-            ("不重要", "不重要"),
+            ("无关", "无关"),
         ],
     )
     def test_labels(self, key, label):
@@ -402,7 +401,7 @@ class TestJudgeViaJev:
             client, {}, "深夜的浴室", "他滑倒了", "他是不是滑倒的"
         )
         criteria = client.calls[0]["questions"][jev_judge.QUESTION_NAME]["criteria"]
-        assert set(criteria) == {"是", "否", "是也不是", "不重要"}
+        assert set(criteria) == {"是", "否", "无关"}
 
     @pytest.mark.asyncio
     async def test_language_can_be_forced(self):
@@ -415,4 +414,67 @@ class TestJudgeViaJev:
             "他是不是滑倒的",
         )
         criteria = client.calls[0]["questions"][jev_judge.QUESTION_NAME]["criteria"]
-        assert set(criteria) == {"yes", "no", "partial", "irrelevant"}
+        assert set(criteria) == {"yes", "no", "irrelevant"}
+
+
+class TestDecisionProcedure:
+    """判定程序必须写进 instructions，否则「否」和「无关」会混。"""
+
+    def _instructions(self, lang):
+        return jev_judge.build_questions(lang)[jev_judge.QUESTION_NAME]["instructions"]
+
+    def test_zh_instructions_contain_key_rules(self):
+        text = self._instructions(jev_judge.LANG_ZH)
+        # 先在真相里找事实 → 找到就答是/否
+        assert "先在「真相」里找" in text
+        # 真相提到过就不要答无关
+        assert "不要答「无关」" in text
+        # 否只在明确排除时用
+        assert "明确排除了这个事实" in text
+        # 无关只在真相沉默时用
+        assert "既没提到、也没排除" in text
+        # 历史只用于消解指代，不能当证据
+        assert "只用来消解" in text and "绝不能当成证据" in text
+
+    def test_en_instructions_contain_key_rules(self):
+        text = self._instructions(jev_judge.LANG_EN)
+        assert "never Irrelevant" in text
+        assert "clearly rules the claim out" in text
+        assert "neither mentions nor rules out" in text
+        assert "never evidence" in text
+
+    def test_criteria_distinguish_no_from_irrelevant(self):
+        criteria = jev_judge.build_questions(jev_judge.LANG_ZH)[
+            jev_judge.QUESTION_NAME
+        ]["criteria"]
+        # 「否」必须写明「真相没提到不算否」
+        assert "不算「否」" in criteria["否"]
+        # 「无关」必须写明「既没提到也没排除」
+        assert "既没提到也没排除" in criteria["无关"]
+
+    def test_serialized_criteria_within_documented_limit(self):
+        """文档限制：每道题的 criteria 序列化后不超过 2000 字符。
+
+        判据越写越详细，越容易撞线——这条一旦破了就是必然的 422。
+        """
+        for lang in (jev_judge.LANG_ZH, jev_judge.LANG_EN):
+            criteria = jev_judge.build_questions(lang)[
+                jev_judge.QUESTION_NAME
+            ]["criteria"]
+            size = len(json.dumps(criteria, ensure_ascii=False))
+            assert size <= 2000, f"{lang} 的 criteria 序列化后 {size} 字符，超上限"
+
+    def test_instructions_within_documented_limit(self):
+        for lang in (jev_judge.LANG_ZH, jev_judge.LANG_EN):
+            instructions = jev_judge.build_questions(lang)[
+                jev_judge.QUESTION_NAME
+            ]["instructions"]
+            assert len(instructions) <= 1800
+
+    def test_only_three_options(self):
+        """选项集对齐 Situation-Puzzle：是 / 否 / 无关。"""
+        for lang in (jev_judge.LANG_ZH, jev_judge.LANG_EN):
+            criteria = jev_judge.build_questions(lang)[
+                jev_judge.QUESTION_NAME
+            ]["criteria"]
+            assert len(criteria) == 3

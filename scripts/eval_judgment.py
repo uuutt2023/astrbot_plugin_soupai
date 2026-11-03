@@ -37,13 +37,20 @@ from astrbot_plugin_soupai.core.jev_transport import JevClient  # noqa: E402
 
 
 class Case:
+    """一个评测用例。
+
+    ``expect`` 可以是单个判定，也可以是一个**可接受集合**——「说对一半」的
+    提问在只有 是/否/无关 三档时本就没有唯一正解，模型选 是 或 否 都算对，
+    区别会体现在置信度上。
+    """
+
     def __init__(
         self,
         name: str,
         puzzle: str,
         truth: str,
         question: str,
-        expect: str,
+        expect,
         recent: Optional[List[Dict[str, str]]] = None,
         note: str = "",
     ):
@@ -51,9 +58,12 @@ class Case:
         self.puzzle = puzzle
         self.truth = truth
         self.question = question
-        self.expect = expect
+        self.expect = expect if isinstance(expect, (tuple, list)) else (expect,)
         self.recent = recent or []
         self.note = note
+
+    def accepts(self, verdict: str) -> bool:
+        return verdict in self.expect
 
 
 # ── 用例（取自插件自带题库，人工标注预期）────────────────────────────────
@@ -108,12 +118,21 @@ CASES: List[Case] = [
         note="「它」= 导盲犬，只有带上历史才消得解",
     ),
     Case(
-        name="部分正确 / 是也不是",
+        name="说对一半 / 是或否皆可",
         puzzle="一个男人推开门，看到眼前的景象后立即跳楼自杀了。为什么？",
         truth="这个男人是灯塔管理员，他发现灯塔的灯灭了，意识到因为自己的疏忽导致船只失事，愧疚之下选择了跳楼。",
         question="他因为愧疚而自杀，但灯塔的灯其实早就坏了、并不是他的疏忽吗",
-        expect="是也不是",
-        note="前半句对（灯塔管理员、愧疚），后半句与真相冲突",
+        expect=("是", "否"),
+        note="前半句对（灯塔管理员、愧疚），后半句与真相冲突——三档下没有专属选项，"
+             "答 是/否 都可，区别看置信度",
+    ),
+    Case(
+        name="无关 / 真相提到过就别判无关",
+        puzzle="一个男人推开门，看到眼前的景象后立即跳楼自杀了。为什么？",
+        truth="这个男人是灯塔管理员，他发现灯塔的灯灭了，意识到因为自己的疏忽导致船只失事，愧疚之下选择了跳楼。",
+        question="他是灯塔管理员吗",
+        expect="是",
+        note="真相顺带提到的事实也算数，不该判无关",
     ),
 ]
 
@@ -168,13 +187,14 @@ async def main() -> int:
             result = await run_case(client, cfg, case, use_history=True)
             verdict = result.get("verdict") or "-"
             confidence = result.get("confidence", 0.0)
-            ok = verdict == case.expect
+            ok = case.accepts(verdict)
             hits += int(ok)
             total += 1
             mark = "✓" if ok else "✗"
             print(f"\n{mark} [{case.name}] {case.note}")
             print(f"   提问: {case.question}")
-            print(f"   预期: {case.expect}   实得: {verdict}   置信度: {confidence:.3f}")
+            expected = "/".join(case.expect)
+            print(f"   预期: {expected}   实得: {verdict}   置信度: {confidence:.3f}")
             if not ok:
                 print(f"   原因: {result.get('reason')}")
 
