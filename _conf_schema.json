@@ -129,6 +129,27 @@
         ],
         "default": "threshold"
       },
+      "prompt_language": {
+        "type": "string",
+        "description": "提示词语言",
+        "hint": "auto＝按题目内容自动判断（中文题目用中文 criteria，英文题目用英文）；zh＝固定用中文；en＝固定用英文。选项标签与玩家看到的保持一致时，判定最稳。",
+        "options": [
+          "auto",
+          "zh",
+          "en"
+        ],
+        "labels": [
+          "自动（跟随题目语言）",
+          "固定中文",
+          "固定英文"
+        ],
+        "subtitles": [
+          "题目里有中文就用中文 criteria，否则用英文——这是多数情况下的最优解。",
+          "始终用中文 criteria 与中文选项（是 / 否 / 是也不是 / 不重要）。",
+          "始终用英文 criteria 与英文选项（yes / no / partial / irrelevant），显示时再映射回中文。"
+        ],
+        "default": "auto"
+      },
       "show_relevance": {
         "type": "bool",
         "description": "显示相关性百分比",

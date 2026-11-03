@@ -165,9 +165,10 @@ class TestBackendDispatch:
         )
 
         state = plugin.jev_client.calls[0]["state"]
-        assert "深夜的浴室" in state
-        assert "他是不是自杀" in state
-        assert "死者是不是男的" in state
+        assert isinstance(state, dict)
+        assert state["汤面"] == "深夜的浴室"
+        assert state["历史问答"] == ["「他是不是自杀」→ 否"]
+        assert state["玩家提问"] == "死者是不是男的"
 
 
 class TestTerminate:

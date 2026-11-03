@@ -498,6 +498,23 @@ class JevClient:
         return result
 
 
+def choice_probability(answer, choice):
+    """取「被选中那一档」的置信度。
+
+    优先取 ``probabilities[choice]``——它才是这一档自己的概率；
+    没有分布时退回顶层 ``confidence`` 字段。两者都没有就是缺概率，
+    属于协议错误：不能默认成 0（那等于拿一个来路不明的判定去回复用户）。
+    """
+    if not isinstance(answer, dict):
+        return None
+    probabilities = answer.get("probabilities")
+    if isinstance(probabilities, dict):
+        value = probabilities.get(choice)
+        if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1:
+            return float(value)
+    return probability({"noul": answer.get("confidence")})
+
+
 def valid_answers(data, questions):
     if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
         return False
@@ -508,13 +525,15 @@ def valid_answers(data, questions):
         if question.get("type") == "noul" and probability(answer) is None:
             return False
         if question.get("type") in ("choice", "score"):
-            if probability({"noul": answer.get("confidence")}) is None:
-                return False
             criteria = question.get("criteria") or {}
-            if question["type"] == "choice" and (
-                not isinstance(answer.get("choice"), str)
-                or answer["choice"] not in criteria
-            ):
+            if question["type"] == "choice":
+                choice = answer.get("choice")
+                if not isinstance(choice, str) or choice not in criteria:
+                    return False
+                # 缺概率 = 协议错误，不默认为 0
+                if choice_probability(answer, choice) is None:
+                    return False
+            elif probability({"noul": answer.get("confidence")}) is None:
                 return False
             if question["type"] == "score":
                 value = answer.get("score")

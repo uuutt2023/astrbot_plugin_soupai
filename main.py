@@ -1083,7 +1083,9 @@ class SoupaiPlugin(Star):
             return None
         logger.info(
             f"Jev 判定: {result.get('verdict')} "
-            f"置信度 {result.get('confidence', 0.0):.3f}"
+            f"置信度 {result.get('confidence', 0.0):.3f} "
+            f"提示词 {result.get('prompt_version', '')} "
+            f"语言 {result.get('language', '')}"
         )
         return JudgeResult(
             str(result.get("verdict") or ""),
@@ -2438,9 +2440,15 @@ class SoupaiPlugin(Star):
         jev_enabled = bool((self.jev_judge_config or {}).get("enabled"))
         jev_line = ""
         if self.judge_backend != JUDGE_BACKEND_LLM:
+            language = jev_judge.resolve_language(
+                self.jev_judge_config.get("prompt_language"), "", "", ""
+            )
+            language_names = {"zh": "中文", "en": "英文"}
             jev_line = (
                 f"• Jev 决策模型：{'已启用' if jev_enabled else '未启用（将回退 LLM）'}"
                 f"（{self.jev_judge_config.get('base_url') or 'https://jevmodel.org'}）\n"
+                f"• Jev 提示词：{jev_judge.PROMPT_VERSION}"
+                f"（语言 {language_names.get(language, language)}）\n"
             )
         config_info = (
             f"⚙️ 海龟汤插件配置：\n"

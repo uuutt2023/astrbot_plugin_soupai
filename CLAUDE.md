@@ -12,9 +12,10 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
 - **`core/` package**: Jev decision backend split into two modules
   - `core/jev_transport.py` — HTTP layer: local request pre-validation, idempotency
     keys, error-code mapping, remaining-credit tracking
-  - `core/jev_judge.py` — pure decision logic: state construction, 4-way choice
-    mapping, confidence gating. **Does not import astrbot**, so it is unit-testable
-    on its own
+  - `core/jev_judge.py` — pure decision logic: structured state construction,
+    language-aware 4-way choice mapping, confidence gating. **Does not import
+    astrbot**, so it is unit-testable on its own. Bump `PROMPT_VERSION` whenever
+    the instructions / criteria / state shape change
 - **AstrBot framework**: Built on AstrBot >= v3.4.36
 - **Thread-safe storage**: `ThreadSafeStoryStorage` class for managing puzzle usage
 - **Game state management**: `GameState` class tracks active games per group
@@ -32,6 +33,8 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
   (`judge_backend` = llm/jev/hybrid, plus the `jev_judge` group)
 - **Metadata**: `metadata.yaml` for plugin registration
 - **Tests**: `tests/` — pytest, with a minimal astrbot stub in `tests/conftest.py`
+- **Eval**: `scripts/eval_judgment.py` — offline judgment regression against the
+  real Jev API (needs `JEVMODEL_API_KEY`); run it after any prompt change
 
 ## Development Commands
 

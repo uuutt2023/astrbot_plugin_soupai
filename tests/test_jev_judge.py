@@ -4,6 +4,7 @@
 """
 
 import importlib
+import json
 import random
 import sys
 from pathlib import Path
@@ -21,66 +22,126 @@ jev_judge = importlib.import_module(f"{_ROOT.name}.core.jev_judge")
 # ── 请求体形状 ──────────────────────────────────────────────────────────
 class TestQuestions:
     def test_single_choice_question(self):
-        questions = jev_judge.build_questions()
+        questions = jev_judge.build_questions(jev_judge.LANG_ZH)
         assert list(questions) == [jev_judge.QUESTION_NAME]
         question = questions[jev_judge.QUESTION_NAME]
         assert question["type"] == "choice"
         assert question["instructions"].strip()
-        assert set(question["criteria"]) == set(jev_judge.VERDICT_LABELS)
+        assert len(question["criteria"]) == 4
 
-    def test_criteria_keys_match_verdict_labels(self):
-        criteria = jev_judge.build_questions()[jev_judge.QUESTION_NAME]["criteria"]
+    def test_chinese_criteria_keys_are_display_labels(self):
+        """中文 criteria 的选项键就是玩家看到的那四个字，省掉一层映射。"""
+        criteria = jev_judge.build_questions(jev_judge.LANG_ZH)[
+            jev_judge.QUESTION_NAME
+        ]["criteria"]
+        assert set(criteria) == {"是", "否", "是也不是", "不重要"}
+
+    def test_english_criteria_keys(self):
+        criteria = jev_judge.build_questions(jev_judge.LANG_EN)[
+            jev_judge.QUESTION_NAME
+        ]["criteria"]
         assert set(criteria) == {"yes", "no", "partial", "irrelevant"}
 
-    def test_instructions_within_documented_limit(self):
-        instructions = jev_judge.build_questions()[jev_judge.QUESTION_NAME]["instructions"]
-        assert len(instructions) <= 1800  # 文档上限
+    def test_criteria_language_matches_request(self):
+        zh = jev_judge.build_questions(jev_judge.LANG_ZH)[jev_judge.QUESTION_NAME]
+        en = jev_judge.build_questions(jev_judge.LANG_EN)[jev_judge.QUESTION_NAME]
+        assert any("一" <= ch <= "鿿" for ch in zh["instructions"])
+        assert not any("一" <= ch <= "鿿" for ch in en["instructions"])
+        assert any("一" <= ch <= "鿿" for ch in zh["criteria"]["是"])
+        assert not any("一" <= ch <= "鿿" for ch in en["criteria"]["yes"])
 
-    def test_criteria_are_english(self):
-        """Jev 主训练语言是英文，选项描述里不该混中文。"""
-        criteria = jev_judge.build_questions()[jev_judge.QUESTION_NAME]["criteria"]
-        for key, text in criteria.items():
-            assert not any("一" <= ch <= "鿿" for ch in text), key
+    def test_instructions_within_documented_limit(self):
+        for lang in (jev_judge.LANG_ZH, jev_judge.LANG_EN):
+            instructions = jev_judge.build_questions(lang)[
+                jev_judge.QUESTION_NAME
+            ]["instructions"]
+            assert len(instructions) <= 1800  # 文档上限
+
+    def test_prompt_version_exists(self):
+        assert jev_judge.PROMPT_VERSION
+
+
+class TestLanguageDetection:
+    def test_detect_chinese(self):
+        assert jev_judge.detect_language("他是男性") == jev_judge.LANG_ZH
+
+    def test_detect_english(self):
+        assert jev_judge.detect_language("he is male") == jev_judge.LANG_EN
+
+    def test_resolve_auto(self):
+        assert jev_judge.resolve_language("auto", "他是男性") == jev_judge.LANG_ZH
+        assert jev_judge.resolve_language("auto", "he is male") == jev_judge.LANG_EN
+
+    def test_resolve_explicit_wins(self):
+        assert jev_judge.resolve_language("zh", "he is male") == jev_judge.LANG_ZH
+        assert jev_judge.resolve_language("en", "他是男性") == jev_judge.LANG_EN
+
+    def test_invalid_preference_falls_back_to_auto(self):
+        assert jev_judge.resolve_language("klingon", "他是男性") == jev_judge.LANG_ZH
 
 
 # ── state 构造 ──────────────────────────────────────────────────────────
 class TestBuildState:
     PUZZLE = "深夜停电，男主人死在上锁的浴室里。"
-    TRUTH = "他是在浴缸里溺死的，滑倒时撞到了头，锁是插销自己落下的。"
+    TRUTH = "他滑倒撞到头后跌进浴缸溺水，锁是他自己装上去的。"
     QUESTION = "死者是不是滑倒的"
 
     def test_contains_all_parts(self):
-        state = jev_judge.build_state(self.PUZZLE, self.TRUTH, self.QUESTION)
-        assert "[Scenario]" in state
-        assert "[Truth]" in state
-        assert "[Player]" in state
-        assert self.TRUTH in state
-        assert self.QUESTION in state
+        state = jev_judge.build_state(
+            self.PUZZLE, self.TRUTH, self.QUESTION, [], language=jev_judge.LANG_ZH
+        )
+        assert isinstance(state, dict)
+        assert state["汤面"] == self.PUZZLE
+        assert state["真相"] == self.TRUTH
+        assert state["玩家提问"] == self.QUESTION
+        assert "历史问答" not in state
 
-    def test_no_history_section_when_empty(self):
-        state = jev_judge.build_state(self.PUZZLE, self.TRUTH, self.QUESTION, [])
-        assert "[History]" not in state
+    def test_english_state_keys(self):
+        state = jev_judge.build_state(
+            self.PUZZLE, self.TRUTH, self.QUESTION, [], language=jev_judge.LANG_EN
+        )
+        assert state["story"] == self.PUZZLE
+        assert state["answer"] == self.TRUTH
+        assert state["playerQuestion"] == self.QUESTION
+
+    def test_history_is_pairs_of_question_and_verdict(self):
+        history = [{"question": "他是不是自缢", "answer": "否"}]
+        state = jev_judge.build_state(
+            self.PUZZLE, self.TRUTH, self.QUESTION, history, language=jev_judge.LANG_ZH
+        )
+        assert state["历史问答"] == ["「他是不是自缢」→ 否"]
 
     def test_history_rounds_limits_entries(self):
-        history = [
-            {"question": f"问题{i}", "answer": "是"} for i in range(10)
-        ]
+        history = [{"question": f"问题{i}", "answer": "是"} for i in range(10)]
         state = jev_judge.build_state(
-            self.PUZZLE, self.TRUTH, self.QUESTION, history, history_rounds=3
+            self.PUZZLE,
+            self.TRUTH,
+            self.QUESTION,
+            history,
+            history_rounds=3,
+            language=jev_judge.LANG_ZH,
         )
-        assert "问题0" not in state
-        assert "问题9" in state
-        assert state.count("Q: ") == 3
+        assert len(state["历史问答"]) == 3
+        assert "问题0" not in state["历史问答"][0]
+        assert "问题9" in state["历史问答"][-1]
 
     def test_history_rounds_zero_disables_history(self):
         history = [{"question": "问题0", "answer": "是"}]
         state = jev_judge.build_state(
-            self.PUZZLE, self.TRUTH, self.QUESTION, history, history_rounds=0
+            self.PUZZLE,
+            self.TRUTH,
+            self.QUESTION,
+            history,
+            history_rounds=0,
+            language=jev_judge.LANG_ZH,
         )
-        assert "[History]" not in state
+        assert "历史问答" not in state
 
     def test_overlong_state_drops_oldest_history_first(self):
-        history = [{"question": f"很长的历史问题{'x' * 200}{i}", "answer": "否"} for i in range(6)]
+        history = [
+            {"question": f"很长的历史问题{'x' * 200}{i}", "answer": "否"}
+            for i in range(6)
+        ]
         state = jev_judge.build_state(
             self.PUZZLE,
             self.TRUTH,
@@ -88,17 +149,23 @@ class TestBuildState:
             history,
             max_chars=600,
             history_rounds=6,
+            language=jev_judge.LANG_ZH,
         )
-        assert len(state) <= 600
+        assert len(json.dumps(state, ensure_ascii=False)) <= 600
         # 真相和玩家提问必须还在（判断的必需信息）
-        assert self.TRUTH in state
-        assert self.QUESTION in state
+        assert state["真相"] == self.TRUTH
+        assert state["玩家提问"] == self.QUESTION
 
     def test_extreme_overflow_is_truncated(self):
         state = jev_judge.build_state(
-            "题面" * 500, "真相" * 500, "提问", None, max_chars=300
+            "题面" * 500,
+            "真相" * 500,
+            "提问",
+            None,
+            max_chars=300,
+            language=jev_judge.LANG_ZH,
         )
-        assert len(state) <= 300
+        assert len(json.dumps(state, ensure_ascii=False)) <= 300
 
 
 # ── 答案解析 ────────────────────────────────────────────────────────────
@@ -106,31 +173,38 @@ class TestVerdictConfidence:
     def test_prefers_probability_of_selected_choice(self):
         answer = {
             "type": "choice",
-            "choice": "no",
+            "choice": "否",
             "confidence": 0.9,
-            "probabilities": {"yes": 0.05, "no": 0.9, "partial": 0.03, "irrelevant": 0.02},
+            "probabilities": {"是": 0.05, "否": 0.9, "是也不是": 0.03, "不重要": 0.02},
         }
-        choice, confidence = jev_judge.verdict_confidence(answer)
-        assert choice == "no"
+        verdict, confidence = jev_judge.verdict_confidence(answer)
+        assert verdict == jev_judge.VERDICT_NO
         assert confidence == pytest.approx(0.9)
 
     def test_falls_back_to_confidence_field(self):
-        choice, confidence = jev_judge.verdict_confidence(
-            {"type": "choice", "choice": "yes", "confidence": 0.42}
+        verdict, confidence = jev_judge.verdict_confidence(
+            {"type": "choice", "choice": "是", "confidence": 0.42}
         )
-        assert choice == "yes"
+        assert verdict == jev_judge.VERDICT_YES
         assert confidence == pytest.approx(0.42)
 
+    def test_english_choice_is_mapped_to_canonical(self):
+        verdict, confidence = jev_judge.verdict_confidence(
+            {"type": "choice", "choice": "partial", "probabilities": {"partial": 0.7}}
+        )
+        assert verdict == jev_judge.VERDICT_PARTIAL
+        assert confidence == pytest.approx(0.7)
+
     def test_unknown_choice_is_rejected(self):
-        choice, confidence = jev_judge.verdict_confidence(
+        verdict, confidence = jev_judge.verdict_confidence(
             {"type": "choice", "choice": "maybe", "confidence": 0.9}
         )
-        assert choice is None
+        assert verdict is None
         assert confidence is None
 
     def test_non_dict_is_rejected(self):
         assert jev_judge.verdict_confidence(None) == (None, None)
-        assert jev_judge.verdict_confidence("yes") == (None, None)
+        assert jev_judge.verdict_confidence("是") == (None, None)
 
 
 # ── 门控 ────────────────────────────────────────────────────────────────
@@ -171,16 +245,19 @@ class TestPickVerdict:
             "type": "choice",
             "choice": key,
             "confidence": confidence,
-            "probabilities": {k: (confidence if k == key else 0.0) for k in jev_judge.VERDICT_LABELS},
+            "probabilities": {
+                k: (confidence if k == key else 0.0)
+                for k in ("是", "否", "是也不是", "不重要")
+            },
         }
 
     @pytest.mark.parametrize(
         "key,label",
         [
-            ("yes", "是"),
-            ("no", "否"),
-            ("partial", "是也不是"),
-            ("irrelevant", "不重要"),
+            ("是", "是"),
+            ("否", "否"),
+            ("是也不是", "是也不是"),
+            ("不重要", "不重要"),
         ],
     )
     def test_labels(self, key, label):
@@ -190,15 +267,28 @@ class TestPickVerdict:
         assert picked["verdict"] == label
 
     def test_low_confidence_falls_back(self):
-        picked = jev_judge.pick_verdict(self._answer("yes", 0.2), 0.6, "threshold")
+        picked = jev_judge.pick_verdict(self._answer("是", 0.2), 0.6, "threshold")
         assert picked["ok"] is False
         assert picked["accepted"] is False
         assert picked["verdict"] == "是"  # 档位仍然解析出来了，只是没采信
 
     def test_invalid_answer_is_not_ok(self):
-        picked = jev_judge.pick_verdict({"type": "choice", "choice": "nope"}, 0.6, "threshold")
+        picked = jev_judge.pick_verdict(
+            {"type": "choice", "choice": "nope"}, 0.6, "threshold"
+        )
         assert picked["ok"] is False
         assert picked["verdict"] == ""
+        assert "协议错误" in picked["reason"]
+
+    def test_missing_probability_is_protocol_error(self):
+        """缺概率不能默认为 0——那等于拿一个来路不明的判定去回复玩家。"""
+        picked = jev_judge.pick_verdict(
+            {"type": "choice", "choice": "是"}, 0.6, "threshold"
+        )
+        assert picked["ok"] is False
+        assert picked["parsed"] is True
+        assert picked["confidence"] == 0.0
+        assert "协议错误" in picked["reason"]
 
 
 # ── 端到端（假客户端）──────────────────────────────────────────────────
@@ -227,9 +317,9 @@ class TestJudgeViaJev:
                 "answers": {
                     "verdict": {
                         "type": "choice",
-                        "choice": "no",
+                        "choice": "否",
                         "confidence": 0.93,
-                        "probabilities": {"yes": 0.02, "no": 0.93},
+                        "probabilities": {"是": 0.02, "否": 0.93},
                     }
                 },
                 "seconds": 2.4,
@@ -244,6 +334,7 @@ class TestJudgeViaJev:
         assert result["verdict"] == "否"
         assert result["confidence"] == pytest.approx(0.93)
         assert result["state_chars"] > 0
+        assert result["prompt_version"] == jev_judge.PROMPT_VERSION
 
     @pytest.mark.asyncio
     async def test_ready_but_unconfident_falls_back(self):
@@ -253,9 +344,9 @@ class TestJudgeViaJev:
                 "answers": {
                     "verdict": {
                         "type": "choice",
-                        "choice": "yes",
+                        "choice": "是",
                         "confidence": 0.2,
-                        "probabilities": {"yes": 0.2},
+                        "probabilities": {"是": 0.2},
                     }
                 },
             }
@@ -298,5 +389,30 @@ class TestJudgeViaJev:
         call = client.calls[0]
         assert list(call["questions"]) == [jev_judge.QUESTION_NAME]
         assert call["questions"][jev_judge.QUESTION_NAME]["type"] == "choice"
-        assert self.TRUTH in call["state"]
-        assert self.QUESTION in call["state"]
+        # state 是结构化对象（Jev 文档允许 string / object / array）
+        assert isinstance(call["state"], dict)
+        assert call["state"]["真相"] == self.TRUTH
+        assert call["state"]["玩家提问"] == self.QUESTION
+        assert call["state"]["历史问答"] == ["「旧问题」→ 是"]
+
+    @pytest.mark.asyncio
+    async def test_language_follows_content(self):
+        client = FakeClient({"status": "ready", "answers": {}})
+        await jev_judge.judge_via_jev(
+            client, {}, "深夜的浴室", "他滑倒了", "他是不是滑倒的"
+        )
+        criteria = client.calls[0]["questions"][jev_judge.QUESTION_NAME]["criteria"]
+        assert set(criteria) == {"是", "否", "是也不是", "不重要"}
+
+    @pytest.mark.asyncio
+    async def test_language_can_be_forced(self):
+        client = FakeClient({"status": "ready", "answers": {}})
+        await jev_judge.judge_via_jev(
+            client,
+            {"prompt_language": "en"},
+            "深夜的浴室",
+            "他滑倒了",
+            "他是不是滑倒的",
+        )
+        criteria = client.calls[0]["questions"][jev_judge.QUESTION_NAME]["criteria"]
+        assert set(criteria) == {"yes", "no", "partial", "irrelevant"}

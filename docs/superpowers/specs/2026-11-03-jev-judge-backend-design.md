@@ -78,41 +78,57 @@ main.py
 
 ## 4. Jev 请求契约
 
-### 4.1 state（字符串）
+### 4.1 state（结构化对象）
 
+Jev 文档明确 `state` 可以是 `string / object / array`，这里用对象：
+
+```json
+{
+  "汤面": "<题面>",
+  "真相": "<完整真相>",
+  "历史问答": ["「他是不是自缢」→ 否"],
+  "玩家提问": "<玩家提问或陈述>"
+}
 ```
-[Lateral-Thinking Puzzle] A "Sea Turtle Soup" riddle game. Judge the player's message.
-[Scenario] <题面>
-[Truth] <完整真相>
-[History] Q: ... A: ...        （最近 history_rounds 轮，超出 max_state_chars 从旧到新截断）
-[Player] <玩家提问或陈述>
-```
+
+- 字段名固定，模型不用从标记里猜边界。
+- 历史问答带**当时的判定**，让"他刚刚说的那个"这类指代有落点。
+- 超长时从最旧的历史开始丢；仍超长则按「真相 → 题面 → 提问」顺序截断。
 
 ### 4.2 questions（单道 choice）
 
 ```json
 {"verdict": {
   "type": "choice",
-  "instructions": "Which single verdict does the player's message deserve? ...",
+  "instructions": "这是一个海龟汤（情境推理）游戏。你是主持人……",
   "criteria": {
-    "yes":        "Yes - ...",
-    "no":         "No - ...",
-    "partial":    "Yes and no - ...",
-    "irrelevant": "Irrelevant - ..."
+    "是":        "玩家说对了：……",
+    "否":        "玩家说错了：……",
+    "是也不是": "说对了一半：……",
+    "不重要":   "与真相无关：……"
   }
 }}
 ```
 
 - 一次请求 1 道题（文档上限 8 道）。
 - `criteria` 为 `{key: description}` 字典，`key` 即返回的 `answers.verdict.choice`。
-- 返回：`{"type":"choice","choice":"yes","probabilities":{...},"confidence":0.93}`。
-- 指令与选项描述一律英文（Jev 主训练语言为英文，CJK 精度低）；
-  `choice` 键映射回中文四档：是 / 否 / 是也不是 / 不重要。
+- **选项标签就是玩家看到的那四个字**，Jev 返回什么就显示什么，不做中间映射。
+- 返回：`{"type":"choice","choice":"否","probabilities":{...},"confidence":0.93}`。
+- 提示词**跟随题目语言**：中文题目用中文 criteria，英文题目用英文
+  （`yes / no / partial / irrelevant`），可用 `prompt_language` 固定口径。
+- **缺概率是协议错误**：不默认为 0，直接回退 LLM。
 
-### 4.3 状态构造约束
+### 4.3 提示词版本
 
-- `max_state_chars` 默认 1200（与 angel_heart 一致），`history_rounds` 默认 6。
+`core/jev_judge.PROMPT_VERSION`（当前 `v1-2026-11-soupai`）。改 instructions /
+criteria / state 结构必须同时升版本，日志与 `/汤配置` 会显示当次用的哪套，
+配合 `scripts/eval_judgment.py` 做回归。
+
+### 4.4 状态构造约束
+
+- `max_state_chars` 默认 1200，`history_rounds` 默认 6。
 - 超限时**从旧到新丢弃**问答历史，优先保留真相与玩家提问。
+- 长度按 Python 默认分隔符序列化测量（比实际发送的紧凑 JSON 略长，宁可算多）。
 
 ## 5. 后端与门控
 
@@ -158,6 +174,8 @@ main.py
 | `timeout_sec` | float | 10.0 | 单次调用超时 |
 | `retries` | int | 1 | 失败重试次数 |
 | `gate_mode` | string | `threshold` | 门控口径 |
+| `prompt_language` | string | `auto` | 提示词语言（auto/zh/en） |
+| `show_relevance` | bool | true | 判定后显示相关性百分比 |
 | `min_confidence` | float | 0.6 | 采信阈值 |
 | `max_state_chars` | int | 1200 | state 长度上限 |
 | `history_rounds` | int | 6 | 带入的历史问答轮数 |
@@ -174,6 +192,8 @@ main.py
   - 回落：Jev 不可用 → LLM
 - 离线 harness：构造真实响应 JSON，验证解析路径。
 - 配置页：Chromium 实测下拉可选项与副标题渲染。
+- 离线评测脚本 `scripts/eval_judgment.py`：固定用例回归判定质量，
+  `--compare` 对比带/不带历史问答的差异（需要真实 Jev API Key）。
 
 ## 9. 性能工作清单
 
