@@ -3,11 +3,19 @@
 这一层不 import astrbot，所以测试不需要框架环境。
 """
 
+import importlib
 import random
+import sys
+from pathlib import Path
 
 import pytest
 
-from astrbot_plugin_soupai.core import jev_judge
+# 插件目录名可能不是 astrbot_plugin_soupai（测试时会被 clone 成别的名字），
+# 这里按实际目录名解析包路径，避免硬编码。
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(_ROOT.parent))
+jev_judge = importlib.import_module(f"{_ROOT.name}.core.jev_judge")
 
 
 # ── 请求体形状 ──────────────────────────────────────────────────────────
