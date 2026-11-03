@@ -4,14 +4,30 @@
 以后再改这些模块时能第一时间发现行为漂移。
 """
 
+import importlib
+import sys
+from pathlib import Path
+
 import pytest
 
-from astrbot_plugin_soupai.core import hints, story, verification
-from astrbot_plugin_soupai.core.results import JudgeResult, VerificationResult
-from astrbot_plugin_soupai.prompts import hint as hint_prompts
-from astrbot_plugin_soupai.prompts import judge as judge_prompts
-from astrbot_plugin_soupai.prompts import story as story_prompts
-from astrbot_plugin_soupai.prompts import verification as ver_prompts
+# 插件目录名可能不是 astrbot_plugin_soupai（测试时会被 clone 成别的名字），
+# 这里按实际目录名解析包路径，避免硬编码。
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(_ROOT.parent))
+_PKG = _ROOT.name
+
+hints = importlib.import_module(f"{_PKG}.core.hints")
+story = importlib.import_module(f"{_PKG}.core.story")
+verification = importlib.import_module(f"{_PKG}.core.verification")
+_results = importlib.import_module(f"{_PKG}.core.results")
+hint_prompts = importlib.import_module(f"{_PKG}.prompts.hint")
+judge_prompts = importlib.import_module(f"{_PKG}.prompts.judge")
+story_prompts = importlib.import_module(f"{_PKG}.prompts.story")
+ver_prompts = importlib.import_module(f"{_PKG}.prompts.verification")
+
+JudgeResult = _results.JudgeResult
+VerificationResult = _results.VerificationResult
 
 
 class TestParseStory:
@@ -145,5 +161,5 @@ class TestVerificationResultObject:
 def test_prompt_modules_are_importable(name):
     import importlib
 
-    module = importlib.import_module(f"astrbot_plugin_soupai.prompts.{name}")
+    module = importlib.import_module(f"{_PKG}.prompts.{name}")
     assert module.__doc__
