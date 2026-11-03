@@ -100,6 +100,31 @@
 - 已配置 LLM 服务商（用于生成谜题、判断问答和生成提示）
 - `aiohttp`（Jev 决策后端使用；AstrBot 本身已依赖，插件的 `requirements.txt` 会自动补齐）
 
+## 🗂️ 目录结构
+
+```
+astrbot_plugin_soupai/
+├── main.py                    # 插件入口：插件类、指令、会话流程（只做接线）
+├── core/                      # 业务逻辑，一个模块一件事
+│   ├── storage.py             # 题库：网络题库 / 本地存储库 / 自定义故事库
+│   ├── game_state.py          # 进行中的对局状态
+│   ├── results.py             # 验证结果 / 判定结果（含相关性百分比）
+│   ├── judge.py               # 问答判断：llm / jev / hybrid 三种后端
+│   ├── hints.py               # 提示：allow_list 名词表 + 方向性提示生成
+│   ├── story.py               # 自动生成谜题 + 解析模型返回
+│   ├── verification.py        # 验证玩家推理 + 解析等级评价
+│   ├── jev_transport.py       # Jev 传输层：预检、幂等键、错误码映射
+│   └── jev_judge.py           # Jev 判定层：state 构造、门控（纯逻辑）
+├── prompts/                   # 所有提示词都在这里，不内嵌在代码里
+│   ├── judge.py               #   LLM 判断提示词（四档）
+│   ├── jev.py                 #   Jev instructions + criteria（三档）
+│   ├── hint.py                #   方向性提示提示词
+│   ├── story.py               #   造题提示词 + 主题表
+│   └── verification.py        #   验证提示词
+├── tests/                     # pytest + 最小 astrbot 桩件
+└── scripts/eval_judgment.py   # 判定质量离线评测（需 JEVMODEL_API_KEY）
+```
+
 ## 🚀 安装使用
 
 1. 将插件放置在 `AstrBot/data/plugins/` 目录下

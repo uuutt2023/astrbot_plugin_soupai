@@ -1,14 +1,9 @@
-import json
 import asyncio
-import os
-import re
-import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register, StarTools
-from astrbot.api.provider import LLMResponse
 from astrbot.api import logger, AstrBotConfig
 from astrbot.core.utils.session_waiter import (
     session_waiter,
@@ -17,459 +12,27 @@ from astrbot.core.utils.session_waiter import (
 )
 from astrbot.api.message_components import At
 
-from .core.jev_transport import JevClient
+# 业务逻辑拆到 core/，提示词拆到 prompts/；这里只做接线
+from .core import hints as hints_mod
 from .core import jev_judge
-
-# 预编译：allow_list 每提取一个候选名词就要用一次，放在模块级避免
-# 每次调用都走 re 的模式缓存查找，也免掉首次调用现场编译的卡顿。
-_TOKEN_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]+")
-_TRAILING_UPPER_RE = re.compile(r".*([A-Z])$")
-
-
-# 线程安全的题库管理基类
-class ThreadSafeStoryStorage:
-    """线程安全的题库管理基类，支持持久化使用记录"""
-
-    def __init__(self, storage_name: str, data_path=None):
-        self.storage_name = storage_name
-        self.data_path = data_path
-        self.used_indexes: set[int] = set()
-        self.lock = threading.Lock()  # 线程锁
-        self.usage_file = (
-            self.data_path / f"{storage_name}_usage.json" if self.data_path else None
-        )
-        self.load_usage_record()
-
-    def load_usage_record(self):
-        """从文件加载使用记录"""
-        if not self.usage_file:
-            self.used_indexes = set()
-            return
-
-        try:
-            if self.usage_file.exists():
-                with open(self.usage_file, "r", encoding="utf-8") as f:
-                    self.used_indexes = set(json.load(f))
-                logger.info(
-                    f"从 {self.usage_file} 加载了 {len(self.used_indexes)} 个使用记录"
-                )
-            else:
-                self.used_indexes = set()
-                logger.info(
-                    f"使用记录文件不存在，创建新的记录: {self.usage_file}"
-                )
-        except Exception as e:
-            logger.error(f"加载使用记录失败: {e}")
-            self.used_indexes = set()
-
-    def save_usage_record(self):
-        """保存使用记录到文件"""
-        if not self.usage_file:
-            return
-
-        try:
-            self.usage_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.usage_file, "w", encoding="utf-8") as f:
-                json.dump(list(self.used_indexes), f, ensure_ascii=False, indent=2)
-            logger.info(
-                f"保存了 {len(self.used_indexes)} 个使用记录到 {self.usage_file}"
-            )
-        except Exception as e:
-            logger.error(f"保存使用记录失败: {e}")
-
-    def reset_usage(self):
-        """重置使用记录"""
-        with self.lock:
-            self.used_indexes.clear()
-            self.save_usage_record()
-            logger.info(f"{self.storage_name} 使用记录已重置")
-
-    def get_usage_info(self) -> Dict:
-        """获取使用记录信息"""
-        with self.lock:
-            return {
-                "used": len(self.used_indexes),
-                "used_indexes": list(self.used_indexes),
-            }
-
-
-# Jev 决策后端
-JUDGE_BACKEND_LLM = "llm"
-JUDGE_BACKEND_JEV = "jev"
-JUDGE_BACKEND_HYBRID = "hybrid"
-JUDGE_BACKENDS = (JUDGE_BACKEND_LLM, JUDGE_BACKEND_JEV, JUDGE_BACKEND_HYBRID)
-
-
-# 游戏状态管理
-class GameState:
-    def __init__(self):
-        self.active_games: Dict[str, Dict] = {}  # 群聊ID -> 游戏状态
-
-    def start_game(self, group_id: str, puzzle: str, answer: str, **extra) -> bool:
-        """开始游戏，返回是否成功"""
-        if group_id in self.active_games:
-            return False
-        game_data = {
-            "puzzle": puzzle,
-            "answer": answer,
-            "is_active": True,
-            "qa_history": [],
-            "hint_history": [],
-        }
-        game_data.update(extra)
-        self.active_games[group_id] = game_data
-        return True
-
-    def end_game(self, group_id: str) -> bool:
-        """结束游戏"""
-        if group_id in self.active_games:
-            del self.active_games[group_id]
-            return True
-        return False
-
-    def get_game(self, group_id: str) -> Optional[Dict]:
-        """获取游戏状态"""
-        return self.active_games.get(group_id)
-
-    def is_game_active(self, group_id: str) -> bool:
-        """检查是否有活跃游戏"""
-        return group_id in self.active_games
-
-
-# 网络海龟汤管理
-class NetworkSoupaiStorage(ThreadSafeStoryStorage):
-    def __init__(self, network_file: str, data_path=None):
-        # 初始化基类
-        super().__init__("network_soupai", data_path)
-        self.network_file = network_file
-        self.stories: List[Dict] = []
-        self.load_stories()
-
-    def load_stories(self):
-        """从文件加载网络海龟汤故事"""
-        try:
-            if os.path.exists(self.network_file):
-                with open(self.network_file, "r", encoding="utf-8") as f:
-                    self.stories = json.load(f)
-                logger.info(
-                    f"从 {self.network_file} 加载了 {len(self.stories)} 个网络海龟汤故事"
-                )
-            else:
-                self.stories = []
-                logger.warning(f"网络海龟汤文件不存在: {self.network_file}")
-        except Exception as e:
-            logger.error(f"加载网络海龟汤失败: {e}")
-            self.stories = []
-
-    def get_story(self) -> Optional[Tuple[str, str]]:
-        """从网络题库获取一个故事，避免重复（线程安全）"""
-        if not self.stories:
-            return None
-
-        with self.lock:
-            # 获取所有可用的索引（排除已使用的）
-            available_indexes = [
-                i for i in range(len(self.stories)) if i not in self.used_indexes
-            ]
-
-            # 如果没有可用题目，清空已用记录，重新开始一轮
-            if not available_indexes:
-                logger.info("网络题库已全部使用完毕，清空记录重新开始")
-                self.used_indexes.clear()
-                available_indexes = list(range(len(self.stories)))
-                # 立即保存重置后的状态
-                self.save_usage_record()
-
-            # 从可用索引中随机选择一个
-            import random
-
-            selected = random.choice(available_indexes)
-            self.used_indexes.add(selected)
-
-            # 保存使用记录
-            self.save_usage_record()
-
-            story = self.stories[selected]
-            logger.info(
-                f"从网络题库获取故事，索引: {selected}, 已使用: {len(self.used_indexes)}/{len(self.stories)}"
-            )
-            return story["puzzle"], story["answer"]
-
-    def get_storage_info(self) -> Dict:
-        """获取网络题库信息"""
-        usage_info = self.get_usage_info()
-        return {
-            "total": len(self.stories),
-            "available": len(self.stories) - usage_info["used"],
-            "used": usage_info["used"],
-        }
-
-
-# 存储库管理
-class LocalSoupaiStorage(ThreadSafeStoryStorage):
-    def __init__(self, storage_file: str, max_size: int = 50, data_path=None):
-        # 初始化基类
-        super().__init__("storage_soupai", data_path)
-        self.storage_file = storage_file
-        self.max_size = max_size
-        self.stories: List[Dict] = []
-        self.load_stories()
-
-    def load_stories(self):
-        """从文件加载故事"""
-        try:
-            storage_path = (
-                self.storage_file
-                if isinstance(self.storage_file, str)
-                else str(self.storage_file)
-            )
-            if os.path.exists(storage_path):
-                with open(storage_path, "r", encoding="utf-8") as f:
-                    self.stories = json.load(f)
-                logger.info(f"从 {storage_path} 加载了 {len(self.stories)} 个故事")
-            else:
-                self.stories = []
-                logger.info("存储库文件不存在，创建新的存储库")
-        except Exception as e:
-            logger.error(f"加载故事失败: {e}")
-            self.stories = []
-
-    def save_stories(self):
-        """保存故事到文件"""
-        try:
-            storage_path = (
-                self.storage_file
-                if isinstance(self.storage_file, str)
-                else str(self.storage_file)
-            )
-            # 确保目录存在
-            os.makedirs(os.path.dirname(storage_path), exist_ok=True)
-            with open(storage_path, "w", encoding="utf-8") as f:
-                json.dump(self.stories, f, ensure_ascii=False, indent=2)
-            logger.info(f"保存了 {len(self.stories)} 个故事到 {storage_path}")
-        except Exception as e:
-            logger.error(f"保存故事失败: {e}")
-
-    def add_story(self, puzzle: str, answer: str) -> bool:
-        """添加故事到存储库"""
-        with self.lock:
-            if len(self.stories) >= self.max_size:
-                # 移除最旧的故事
-                self.stories.pop(0)
-                logger.info("存储库已满，移除最旧的故事")
-
-            story = {
-                "puzzle": puzzle,
-                "answer": answer,
-                "created_at": datetime.now().isoformat(),
-            }
-            self.stories.append(story)
-            self.save_stories()
-            logger.info(f"添加新故事到存储库，当前存储库大小: {len(self.stories)}")
-            return True
-
-    def get_story(self) -> Optional[Tuple[str, str]]:
-        """从存储库获取一个故事，避免重复（线程安全）"""
-        if not self.stories:
-            return None
-
-        with self.lock:
-            # 获取所有可用的索引（排除已使用的）
-            available_indexes = [
-                i for i in range(len(self.stories)) if i not in self.used_indexes
-            ]
-
-            # 如果没有可用题目，清空已用记录，重新开始一轮
-            if not available_indexes:
-                logger.info("本地存储库已全部使用完毕，清空记录重新开始")
-                self.used_indexes.clear()
-                available_indexes = list(range(len(self.stories)))
-                # 立即保存重置后的状态
-                self.save_usage_record()
-
-            # 从可用索引中随机选择一个
-            import random
-
-            selected = random.choice(available_indexes)
-            self.used_indexes.add(selected)
-
-            # 保存使用记录
-            self.save_usage_record()
-
-            story = self.stories[selected]
-            logger.info(
-                f"从本地存储库获取故事，索引: {selected}, 已使用: {len(self.used_indexes)}/{len(self.stories)}"
-            )
-            return story["puzzle"], story["answer"]
-
-    def get_storage_info(self) -> Dict:
-        """获取存储库信息"""
-        usage_info = self.get_usage_info()
-        return {
-            "total": len(self.stories),
-            "max_size": self.max_size,
-            "available": self.max_size - len(self.stories),
-            "used": usage_info["used"],
-            "remaining": len(self.stories) - usage_info["used"],
-        }
-
-
-# 自定义海龟汤存储
-class CustomSoupaiStorage(ThreadSafeStoryStorage):
-    def __init__(self, storage_file: str, data_path=None):
-        # 初始化基类
-        super().__init__("custom_soupai", data_path)
-        self.storage_file = storage_file
-        self.stories: List[Dict] = []
-        self.load_stories()
-
-    def load_stories(self):
-        """从文件加载自定义故事"""
-        try:
-            storage_path = (
-                self.storage_file
-                if isinstance(self.storage_file, str)
-                else str(self.storage_file)
-            )
-            if os.path.exists(storage_path):
-                with open(storage_path, "r", encoding="utf-8") as f:
-                    self.stories = json.load(f)
-                logger.info(f"从 {storage_path} 加载了 {len(self.stories)} 个自定义海龟汤故事")
-            else:
-                self.stories = []
-                logger.info("自定义海龟汤文件不存在，创建新的存储库")
-        except Exception as e:
-            logger.error(f"加载自定义海龟汤失败: {e}")
-            self.stories = []
-
-    def save_stories(self):
-        """保存自定义故事到文件"""
-        try:
-            storage_path = (
-                self.storage_file
-                if isinstance(self.storage_file, str)
-                else str(self.storage_file)
-            )
-            # 确保目录存在
-            os.makedirs(os.path.dirname(storage_path), exist_ok=True)
-            with open(storage_path, "w", encoding="utf-8") as f:
-                json.dump(self.stories, f, ensure_ascii=False, indent=2)
-            logger.info(f"保存了 {len(self.stories)} 个自定义海龟汤故事到 {storage_path}")
-        except Exception as e:
-            logger.error(f"保存自定义海龟汤失败: {e}")
-
-    def add_story(self, puzzle: str, answer: str) -> bool:
-        """添加自定义故事到存储库"""
-        with self.lock:
-            story = {
-                "puzzle": puzzle,
-                "answer": answer,
-                "created_at": datetime.now().isoformat(),
-            }
-            self.stories.append(story)
-            self.save_stories()
-            logger.info(f"添加新自定义海龟汤故事，当前存储库大小: {len(self.stories)}")
-            return True
-
-    def get_story(self) -> Optional[Tuple[str, str]]:
-        """从自定义存储库获取一个故事，避免重复（线程安全）"""
-        if not self.stories:
-            return None
-
-        with self.lock:
-            # 获取所有可用的索引（排除已使用的）
-            available_indexes = [
-                i for i in range(len(self.stories)) if i not in self.used_indexes
-            ]
-
-            # 如果没有可用题目，清空已用记录，重新开始一轮
-            if not available_indexes:
-                logger.info("自定义存储库已全部使用完毕，清空记录重新开始")
-                self.used_indexes.clear()
-                available_indexes = list(range(len(self.stories)))
-                # 立即保存重置后的状态
-                self.save_usage_record()
-
-            # 从可用索引中随机选择一个
-            import random
-
-            selected = random.choice(available_indexes)
-            self.used_indexes.add(selected)
-
-            # 保存使用记录
-            self.save_usage_record()
-
-            story = self.stories[selected]
-            logger.info(
-                f"从自定义存储库获取故事，索引: {selected}, 已使用: {len(self.used_indexes)}/{len(self.stories)}"
-            )
-            return story["puzzle"], story["answer"]
-
-    def get_storage_info(self) -> Dict:
-        """获取自定义存储库信息"""
-        usage_info = self.get_usage_info()
-        return {
-            "total": len(self.stories),
-            "used": usage_info["used"],
-            "remaining": len(self.stories) - usage_info["used"],
-        }
-
-
-# 验证结果类
-class VerificationResult:
-    """验证结果类"""
-
-    def __init__(self, level: str, comment: str, is_correct: bool = False):
-        self.level = level
-        self.comment = comment
-        self.is_correct = is_correct
-
-    def to_dict(self) -> Dict:
-        return {
-            "level": self.level,
-            "comment": self.comment,
-            "is_correct": self.is_correct,
-        }
-
-
-class JudgeResult:
-    """一次问答判断的结果。
-
-    - ``verdict``：干净的判定（是 / 否 / 是也不是 / 不重要），问答历史存这个；
-    - ``confidence``：Jev 对该判定的把握（0 表示来自 LLM，LLM 不给概率）；
-    - ``source``：判定来源（``llm`` / ``jev``）。
-
-    拆开存是为了让「历史里的判定」保持干净，而「发给玩家的文本」可以按开关
-    附带相关性百分比——百分比只是提示，不该污染历史和后续提示词。
-    """
-
-    def __init__(self, verdict: str, confidence: float = 0.0, source: str = "llm"):
-        self.verdict = verdict
-        self.confidence = confidence
-        self.source = source
-
-    def relevance_text(self) -> str:
-        """相关性百分比文本，例如「相关性 88%」；LLM 判定或概率缺失时为空串。"""
-        if self.source != "jev" or self.confidence <= 0:
-            return ""
-        percent = self.confidence * 100
-        # 概率极小时四舍五入会变成 0%，那会误导人，直接写 <1%
-        text = "<1%" if percent < 1 else f"{percent:.0f}%"
-        return f"相关性 {text}"
-
-    def display(self, count_text: str = "", show_relevance: bool = False) -> str:
-        """最终发给玩家的文本。
-
-        有提问计数时把计数与相关性放进同一组括号：「是（3/10，相关性 88%）」；
-        没有计数时：「是（相关性 88%）」。
-        """
-        relevance = self.relevance_text() if show_relevance else ""
-        if count_text:
-            inner = count_text + (f"，{relevance}" if relevance else "")
-            return f"{self.verdict}（{inner}）"
-        if relevance:
-            return f"{self.verdict}（{relevance}）"
-        return self.verdict
+from .core import judge as judge_mod
+from .core import story as story_mod
+from .core import verification as verification_mod
+from .core.game_state import GameState
+from .core.judge import (
+    JUDGE_BACKEND_HYBRID,
+    JUDGE_BACKEND_JEV,
+    JUDGE_BACKEND_LLM,
+    JUDGE_BACKENDS,
+)
+from .core.jev_transport import JevClient
+from .core.results import JudgeResult, VerificationResult
+from .core.storage import (
+    CustomSoupaiStorage,
+    LocalSoupaiStorage,
+    NetworkSoupaiStorage,
+    ThreadSafeStoryStorage,
+)
 
 
 # 自定义会话过滤器 - 以群为单位进行会话控制
@@ -692,334 +255,73 @@ class SoupaiPlugin(Star):
                 await asyncio.sleep(300)  # 出错后等待5分钟再试
 
     # ✅ 生成谜题和答案
-    async def generate_story_with_llm(self) -> Tuple[str, str]:
-        """使用 LLM 生成海龟汤谜题"""
+    # ── AI 能力的薄封装 ──────────────────────────────────────────────
+    # 具体实现在 core/ 下：judge=问答判断, hints=提示, story=造题,
+    # verification=验证。这里只负责「按配置选 provider」和兜底文案。
 
-        # 根据配置获取指定的生成 LLM 提供商
+    def _resolve_generate_provider(self):
+        """解析生成谜题用的 LLM 提供商；找不到返回 None。"""
         if self.generate_llm_provider_id:
             provider = self.context.get_provider_by_id(self.generate_llm_provider_id)
             if provider is None:
                 logger.error(
                     f"未找到指定的生成 LLM 提供商: {self.generate_llm_provider_id}"
                 )
-                return "（无法生成题面，指定的生成 LLM 提供商不存在）", "（无）"
-        else:
-            provider = self.context.get_using_provider()
-            if provider is None:
-                logger.error("未配置 LLM 服务商")
-                return "（无法生成题面，请先配置大语言模型）", "（无）"
+            return provider
+        return self.context.get_using_provider()
 
-        prompt = self._build_puzzle_prompt()
-
-        try:
-            logger.info("开始调用 LLM 生成谜题...")
-            llm_resp: LLMResponse = await provider.text_chat(
-                prompt=prompt,
-                contexts=[],
-                func_tool=None,
-                image_urls=[],
-                system_prompt="你是一个专业的反转推理谜题创作者，专门为海龟汤游戏设计谜题。你需要创作简洁、具象、有逻辑反转的谜题，让玩家能够通过是/否提问逐步还原真相。每次创作都必须全新、原创，不能重复已有故事。",
-            )
-
-            text = llm_resp.completion_text.strip()
-            logger.info(f"LLM 返回内容: {text}")
-
-            # 尝试多种格式解析
-            puzzle = None
-            answer = None
-
-            # 格式1: "题面：xxx 答案：xxx"
-            if "题面：" in text and "答案：" in text:
-                puzzle = text.split("题面：")[1].split("答案：")[0].strip()
-                answer = text.split("答案：")[1].strip()
-
-            # 格式2: "**题面**：xxx **答案**：xxx" (Markdown格式)
-            elif "**题面**" in text and "**答案**" in text:
-                puzzle = text.split("**题面**")[1].split("**答案**")[0].strip()
-                if puzzle.startswith("：") or puzzle.startswith(":"):
-                    puzzle = puzzle[1:].strip()
-                answer = text.split("**答案**")[1].strip()
-                if answer.startswith("：") or answer.startswith(":"):
-                    answer = answer[1:].strip()
-
-            # 格式3: "题面：xxx\n答案：xxx"
-            elif "题面：" in text and "\n答案：" in text:
-                puzzle = text.split("题面：")[1].split("\n答案：")[0].strip()
-                answer = text.split("\n答案：")[1].strip()
-
-            # 格式4: 尝试从文本中提取题面和答案
-            else:
-                lines = text.split("\n")
-                for i, line in enumerate(lines):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-
-                    # 寻找题面
-                    if not puzzle and ("题面" in line or "**题面**" in line):
-                        puzzle = line
-                        if "：" in line:
-                            puzzle = line.split("：", 1)[1].strip()
-                        elif ":" in line:
-                            puzzle = line.split(":", 1)[1].strip()
-                        # 移除可能的Markdown标记
-                        puzzle = puzzle.replace("**", "").replace("*", "").strip()
-
-                    # 寻找答案
-                    elif not answer and ("答案" in line or "**答案**" in line):
-                        answer = line
-                        if "：" in line:
-                            answer = line.split("：", 1)[1].strip()
-                        elif ":" in line:
-                            answer = line.split(":", 1)[1].strip()
-                        # 移除可能的Markdown标记
-                        answer = answer.replace("**", "").replace("*", "").strip()
-
-                    # 如果找到了题面但还没找到答案，继续寻找
-                    elif puzzle and not answer and len(line) > 20:
-                        # 可能是答案的开始
-                        answer = line
-
-            if puzzle and answer:
-                # 清理答案中的多余内容
-                if "----" in answer:
-                    answer = answer.split("----")[0].strip()
-                if "---" in answer:
-                    answer = answer.split("---")[0].strip()
-
-                logger.info(f"成功解析谜题: 题面='{puzzle}', 答案='{answer}'")
-                return puzzle, answer
-
-            logger.error(f"LLM 返回内容格式错误: {text}")
-            return "生成失败", "无法解析 LLM 返回的内容"
-        except Exception as e:
-            logger.error(f"生成谜题失败: {e}")
-            return "生成失败", f"LLM 调用出错: {e}"
-
-    def _build_puzzle_prompt(self) -> str:
-        """构建谜题生成的提示词"""
-        import random
-
-        # 丰富的主题列表，增加多样性
-        themes = [
-            # 🔍 人类行为与误导
-            "误解他人行为的代价",
-            "看似反常实则合理的选择",
-            "主动伪装带来的反转",
-            "隐瞒真相与道德困境",
-            "他人为主角设下的圈套",
-            "故意失败的计划",
-            "真实动机被遮蔽",
-            "道德与规则的冲突",
-            # 🧠 心理博弈与控制
-            "陷害与自保之间的抉择",
-            "信息不对称引发的误判",
-            "操控他人感知的行为",
-            "主观偏见导致的误解",
-            "冷静外表下的激烈动机",
-            "以退为进的心理策略",
-            # 🧪 现实逻辑与错觉
-            "空间结构引发的错觉",
-            "物品使用的误导性",
-            "因果顺序的错配",
-            "隐藏在日常中的意外用途",
-            "非典型证据的误导",
-            "时间线的巧妙安排",
-            # 📍 社会环境与冲突
-            "职场中的暗中博弈",
-            "公众场合下的隐秘行为",
-            "权力结构下的自我保护",
-            "日常制度漏洞的利用",
-            "面对规则边缘的选择",
-            "技术被滥用的后果",
-            "资源争夺下的灰色行为",
-            # 🧩 特定身份与角色
-            "保安不是最了解监控的人",
-            "程序员的删除并非错误",
-            "清洁工的观察比谁都细致",
-            "老师的行为引发质疑",
-            "医生做出的不寻常选择",
-            "司机的路线似乎有问题",
-            "演员的自毁是否另有用意",
-            # 🕯 情感错位与人性
-            "好意引发的巨大误会",
-            "爱被误解为恶意",
-            "习惯性行为暴露了真相",
-            "为了他人不得不说谎",
-            "逃避责任的精心设计",
-            "牺牲某人换取整体安全",
-        ]
-
-        selected_theme = random.choice(themes)
-
-        prompt = (
-            f"你是一个逻辑推理谜题设计师，正在创作一个用于【海龟汤游戏】的原创谜题。\n\n"
-            "【目标】：生成一个结构清晰、信息复杂、具备反差感的逻辑谜题，玩家可以通过是/否提问逐步还原真相。答案中解释的所有行为和结果，必须都在题面中有所体现或留有暗示，禁止引入题面未提及的核心行为或结果。谜题在满足以上要求的前提下，应尽可能风格多样、身份多样、行为设定独特、反转机制不重复，避免模板化创作。\n\n"
-            "【题面】要求：\n"
-            "1~2句话，控制在30字以内，但不能过短或单一；\n"
-            "必须包含具体人物 + 至少两个具体细节或行为（如行为+环境、行为+结果、两个动作等）；\n"
-            "行为必须具象明确，严禁使用抽象词、形容词、心理或情绪描述；\n"
-            "必须包含异常或矛盾要素，能引发为什么？的思考；\n"
-            "允许黑暗元素，如陷害、伤害、诱导、自残、掩盖证据等冷峻现实情节；\n"
-            "不得使用幻想、梦境、魔法、精神病等设定；\n"
-            "使用陈述句，不得使用疑问句或解释语气。\n\n"
-            "【答案】要求：\n"
-            "不超过200字；\n"
-            "真实可实现，具有完整因果逻辑；\n"
-            "至少包含两个推理层次或误导点（例如动机误导+情境误导）；\n"
-            "不得出现反转在于、真相是、实际上之类的总结或解释语；\n"
-            "不要使用说明性句子或教学语气；\n"
-            "整体氛围可偏冷峻，但必须具备可还原性，逻辑自洽。\n"
-            "答案仅用于解释题面中已有行为与结果，禁止引入题面未包含的额外关键事件或角色。\n\n"
-            "参考例子：\n"
-            "题面：女演员在试镜前剪断了自己的裙子，却最终被录取。\n"
-            "答案：这名女演员事先得知试镜剧本中有一幕裙子被撕裂的情节。她故意提前剪开裙子并精心处理切口，使在表演时裙子自然裂开看起来逼真震撼。评审认为她的表演最具冲击力，毫不犹豫录取了她。她的破坏行为反而让她脱颖而出。\n\n"
-            "【输出格式】：\n"
-            "题面：XXX\n"
-            "答案：XXX\n\n"
-            f"请基于「{selected_theme}」主题生成一个完全原创的反转推理谜题。"
-        )
-
-        return prompt
-
-    async def _generate_for_storage(self) -> bool:
-        """为存储库生成故事"""
-        try:
-            puzzle, answer = await self.generate_story_with_llm()
-            if puzzle and answer and not puzzle.startswith("（"):
-                self.local_story_storage.add_story(puzzle, answer)
-                logger.info("为存储库生成故事成功")
-                return True
-            else:
-                logger.warning("为存储库生成故事失败")
-                return False
-        except Exception as e:
-            logger.error(f"为存储库生成故事错误: {e}")
-            return False
-
-    # ✅ 验证用户推理
-    async def verify_user_guess(
-            self, user_guess: str, true_answer: str
-    ) -> VerificationResult:
-        """
-        验证用户推理
-
-        Args:
-            user_guess: 用户的推理内容
-            true_answer: 标准答案
-
-        Returns:
-            VerificationResult: 验证结果
-        """
-        # 获取判断 LLM 提供商
+    def _resolve_judge_provider(self):
+        """解析判断/提示/验证用的 LLM 提供商；找不到返回 None。"""
         if self.judge_llm_provider_id:
             provider = self.context.get_provider_by_id(self.judge_llm_provider_id)
             if provider is None:
                 logger.error(
                     f"未找到指定的判断 LLM 提供商: {self.judge_llm_provider_id}"
                 )
-                return VerificationResult("验证失败", "未配置判断 LLM，无法验证")
-        else:
-            provider = self.context.get_using_provider()
+            return provider
+        return self.context.get_using_provider()
+
+    def _judge_provider_or_message(self):
+        """惰性取判断用的 LLM 提供商，返回 (provider, 兜底文案)。
+
+        惰性是有意的：Jev 判定成功时，不该再打「未找到 LLM」的错误日志。
+        """
+        if self.judge_llm_provider_id:
+            provider = self.context.get_provider_by_id(self.judge_llm_provider_id)
             if provider is None:
-                return VerificationResult("验证失败", "未配置 LLM，无法验证")
+                logger.error(
+                    f"未找到指定的判断 LLM 提供商: {self.judge_llm_provider_id}"
+                )
+                return None, "（未配置判断 LLM，无法判断）"
+            return provider, None
+        provider = self.context.get_using_provider()
+        if provider is None:
+            return None, "（未配置 LLM，无法判断）"
+        return provider, None
 
-        # 构建验证提示词
-        system_prompt = self._build_verification_system_prompt()
-        user_prompt = self._build_verification_user_prompt(user_guess, true_answer)
+    async def generate_story_with_llm(self) -> Tuple[str, str]:
+        """使用 LLM 生成海龟汤谜题（实现见 core.story）"""
+        provider = self._resolve_generate_provider()
+        if provider is None:
+            if self.generate_llm_provider_id:
+                return "（无法生成题面，指定的生成 LLM 提供商不存在）", "（无）"
+            logger.error("未配置 LLM 服务商")
+            return "（无法生成题面，请先配置大语言模型）", "（无）"
+        return await story_mod.generate_story(provider)
 
-        try:
-            logger.info(f"开始验证用户推理: '{user_guess[:50]}...'")
+    async def verify_user_guess(
+            self, user_guess: str, true_answer: str
+    ) -> VerificationResult:
+        """验证用户推理（实现见 core.verification）"""
+        provider = self._resolve_judge_provider()
+        if provider is None:
+            if self.judge_llm_provider_id:
+                return VerificationResult("验证失败", "未配置判断 LLM，无法验证")
+            return VerificationResult("验证失败", "未配置 LLM，无法验证")
+        return await verification_mod.verify_user_guess(
+            provider, user_guess, true_answer
+        )
 
-            llm_resp: LLMResponse = await provider.text_chat(
-                prompt=user_prompt,
-                contexts=[],
-                func_tool=None,
-                image_urls=[],
-                system_prompt=system_prompt,
-            )
-
-            text = llm_resp.completion_text.strip()
-            logger.info(f"验证 LLM 返回内容: {text}")
-
-            # 解析验证结果
-            result = self._parse_verification_result(text)
-            return result
-
-        except Exception as e:
-            logger.error(f"验证用户推理失败: {e}")
-            return VerificationResult("验证失败", f"验证过程中发生错误: {e}")
-
-    def _build_verification_system_prompt(self) -> str:
-        """构建验证系统提示词"""
-        return """你是一个推理游戏的裁判。玩家需要还原一个隐藏的完整故事，你的任务是根据玩家的陈述与标准答案对比，判断其相似程度。
-
-你的任务是对这两个内容进行比较，判断它们在"核心因果逻辑、关键行为动机、事件结果解释"方面是否一致。
-
-请根据相似程度将玩家推理划分为以下四个等级之一：
-
-1. 完全还原：核心逻辑、动机、因果链、关键行为全部准确复原，无明显偏差；
-2. 核心推理正确：主干因果逻辑清晰、关键转折已被识别，但部分细节错误或过程含混；
-3. 部分正确：推理中包含部分正确线索或行为判断，但整体逻辑不完整或动机解释偏离；
-4. 基本不符：推理内容与真相不符，逻辑错误严重，无法解释题面设定。
-
-请输出以下格式：
-等级：{等级}
-评价：{一句简评}
-
-注意：
-- 当等级为"完全还原"或"核心推理正确"时，表示玩家基本猜中了故事真相。
-- 评价应中立简洁，仅反映玩家推理的整体完成度、偏离程度或结构性问题。  
-- 严禁直接或间接泄露正确答案中的信息，包括行为动机、情节真相、因果反转等。  
-- 不得使用带有暗示性的语句，如"其实…"、"你忽略了…"、"正确是…"等。
-- 只输出等级和评价，不要添加其他内容。"""
-
-    def _build_verification_user_prompt(self, user_guess: str, true_answer: str) -> str:
-        """构建验证用户提示词"""
-        return f"""标准答案是：
-{true_answer}
-
-玩家还原的推理是：
-{user_guess}
-
-请判断其等级和简评。"""
-
-    def _parse_verification_result(self, text: str) -> VerificationResult:
-        """解析验证结果"""
-        try:
-            # 提取等级和评价
-            lines = text.strip().split("\n")
-            level = ""
-            comment = ""
-
-            for line in lines:
-                line = line.strip()
-                if line.startswith("等级："):
-                    level = line.replace("等级：", "").strip()
-                elif line.startswith("评价："):
-                    comment = line.replace("评价：", "").strip()
-
-            # 判断是否猜中
-            is_correct = level in ["完全还原", "核心推理正确"]
-
-            if not level or not comment:
-                # 如果解析失败，尝试从文本中提取信息
-                if "完全还原" in text or "核心推理正确" in text:
-                    level = "核心推理正确" if "核心推理正确" in text else "完全还原"
-                    comment = "推理基本正确，但解析结果格式异常"
-                    is_correct = True
-                else:
-                    level = "验证失败"
-                    comment = "无法解析验证结果"
-                    is_correct = False
-
-            return VerificationResult(level, comment, is_correct)
-
-        except Exception as e:
-            logger.error(f"解析验证结果失败: {e}")
-            return VerificationResult("验证失败", f"解析验证结果时发生错误: {e}")
-
-    # ✅ 判断提问的回答方式
     async def judge_question(
         self,
         question: str,
@@ -1037,148 +339,20 @@ class SoupaiPlugin(Star):
 
         Jev 永远不能把游戏搞坏：Jev 侧任何异常都会回落到 LLM。
         """
-        if self.judge_backend in (JUDGE_BACKEND_JEV, JUDGE_BACKEND_HYBRID):
-            judged = await self._judge_via_jev(
-                question, true_answer, puzzle, qa_history
-            )
-            if judged is not None:
-                return judged
-        return JudgeResult(
-            await self._judge_with_llm(question, true_answer), source="llm"
+        return await judge_mod.judge_question(
+            self._judge_provider_or_message,
+            self.jev_client,
+            self.judge_backend,
+            self.jev_judge_config,
+            question,
+            true_answer,
+            puzzle,
+            qa_history,
         )
 
-    async def _judge_via_jev(
-        self,
-        question: str,
-        true_answer: str,
-        puzzle: str = "",
-        qa_history: Optional[List[Dict[str, str]]] = None,
-    ) -> Optional[JudgeResult]:
-        """用 Jev 判断玩家提问；不可用时返回 None（调用方回退 LLM）。"""
-        cfg = self.jev_judge_config
-        if not cfg.get("enabled"):
-            logger.info("Jev 判断未启用，使用 LLM 判断")
-            return None
-        try:
-            result = await jev_judge.judge_via_jev(
-                self.jev_client,
-                cfg,
-                puzzle,
-                true_answer,
-                question,
-                qa_history,
-                gate_mode=cfg.get("gate_mode") or jev_judge.GATE_MODE_THRESHOLD,
-                min_confidence=cfg.get(
-                    "min_confidence", jev_judge.DEFAULT_MIN_CONFIDENCE
-                ),
-            )
-        except Exception as e:
-            logger.error(f"Jev 判断异常，回退 LLM: {e}")
-            return None
-
-        if not result.get("ok"):
-            logger.warning(
-                f"Jev 未给出可用判定（{result.get('reason', '未知')}），回退 LLM"
-            )
-            return None
-        logger.info(
-            f"Jev 判定: {result.get('verdict')} "
-            f"置信度 {result.get('confidence', 0.0):.3f} "
-            f"提示词 {result.get('prompt_version', '')} "
-            f"语言 {result.get('language', '')}"
-        )
-        return JudgeResult(
-            str(result.get("verdict") or ""),
-            confidence=float(result.get("confidence") or 0.0),
-            source="jev",
-        )
-
-    async def _judge_with_llm(self, question: str, true_answer: str) -> str:
-        """使用 LLM 判断用户提问的回答方式"""
-
-        # 根据配置获取指定的判断 LLM 提供商
-        if self.judge_llm_provider_id:
-            provider = self.context.get_provider_by_id(self.judge_llm_provider_id)
-            if provider is None:
-                logger.error(
-                    f"未找到指定的判断 LLM 提供商: {self.judge_llm_provider_id}"
-                )
-                return "（未配置判断 LLM，无法判断）"
-        else:
-            provider = self.context.get_using_provider()
-            if provider is None:
-                return "（未配置 LLM，无法判断）"
-
-        prompt = (
-            f"海龟汤游戏规则：\n"
-            f"1. 故事的完整真相是：{true_answer}\n"
-            f'2. 玩家提问或陈述："{question}"\n'
-            f"3. 你的任务是判断玩家的说法是否符合真相。\n"
-            f"4. 只能回答：\"是\"、\"否\"、\"不重要\"或\"是也不是\"。\n\n"
-            f"判定标准：\n"
-            f"- \"是\"：\n"
-            f"  玩家命中关键事实或行为，且该信息能直接帮助接近真相。缺少部分细节可以忽略，只要不影响推理方向，就判\"是\"。\n"
-            f"- \"否\"：\n"
-            f"  与真相完全不符，或包含明显错误，会使玩家推理走向错误方向。\n"
-            f"- \"不重要\"：\n"
-            f"  与故事真相无关，或该信息无法推动推理进展。\n"
-            f"- \"是也不是\"：\n"
-            f"  玩家命中部分事实，但：\n"
-            f"    1) 因果关系不完整或存在偏差；\n"
-            f"    2) 表述中包含可能让玩家推理错误的成分；\n"
-            f"    3) 忽略了与当前描述直接相关的重要关键点。\n"
-            f"  如果只是缺少背景信息，但不影响方向，优先判\"是\"而不是\"是也不是\"。\n\n"
-            f"额外说明：\n"
-            f"- 不要求玩家一次性说出全部真相。\n"
-            f"- 允许玩家只描述真相的一部分，只要方向正确且不会误导，就判\"是\"。\n"
-            f"- 对可能误导玩家的陈述要谨慎，宁可判\"是也不是\"。\n"
-            f"- 判定时平衡游戏流畅性和推理挑战性。"
-        )
-
-        try:
-            llm_resp: LLMResponse = await provider.text_chat(
-                prompt=prompt,
-                contexts=[],
-                func_tool=None,
-                image_urls=[],
-                system_prompt='你是一个海龟汤推理游戏的助手。你必须严格按照游戏规则回答，只能回答"是"、"否"、"不重要"或"是也不是"，不能添加任何其他内容。',
-            )
-
-            valid_responses = {"是", "否", "是也不是", "不重要"}
-            reply = llm_resp.completion_text.strip()
-            if reply in valid_responses:
-                return reply
-            return "你给ai干宕机了或者有什么其他原因，反正他没好好回复，我也不知道为什么（我努力修过代码了）"
-
-        except Exception as e:
-            logger.error(f"判断问题失败: {e}")
-            return "（判断失败，请重试）"
-
-    # ✅ 生成方向性提示
     def build_allow_list(self, puzzle: str, qa_history: List[Dict[str, str]]) -> List[str]:
-        """根据题面和历史问答构建允许在提示中出现的名词列表"""
-        # 汇总文本：题面 + 所有问答
-        parts = [puzzle] + [
-            f"{item.get('question', '')}{item.get('answer', '')}" for item in qa_history
-        ]
-        text = "\n".join(parts)
-
-        # 提取连续的中文、字母或数字片段作为候选名词
-        tokens = _TOKEN_RE.findall(text)
-
-        allow: List[str] = []
-        seen = set()
-        for token in tokens:
-            if not token:
-                continue
-            # 同义合并：例如“男人A”“嫌疑人A”只保留末尾的大写字母
-            m = _TRAILING_UPPER_RE.match(token)
-            if m:
-                token = m.group(1)
-            if token not in seen:
-                seen.add(token)
-                allow.append(token)
-        return allow
+        """构建提示里允许出现的名词表（实现见 core.hints）"""
+        return hints_mod.build_allow_list(puzzle, qa_history)
 
     async def generate_hint(
             self,
@@ -1188,58 +362,34 @@ class SoupaiPlugin(Star):
             hint_history: List[str],
             allow_list: List[str],
     ) -> str:
-        """根据本局已记录的问答与提示生成新的方向性提示"""
-        if self.judge_llm_provider_id:
-            provider = self.context.get_provider_by_id(self.judge_llm_provider_id)
-            if provider is None:
-                logger.error(
-                    f"未找到指定的判断 LLM 提供商: {self.judge_llm_provider_id}"
-                )
+        """根据本局已记录的问答与提示生成新的方向性提示（实现见 core.hints）"""
+        provider = self._resolve_judge_provider()
+        if provider is None:
+            if self.judge_llm_provider_id:
                 return "（未配置判断 LLM，无法提供提示）"
-        else:
-            provider = self.context.get_using_provider()
-            if provider is None:
-                return "（未配置 LLM，无法提供提示）"
-
-        history_text = "\n".join(
-            [f"问：{item['question']}\n答：{item['answer']}" for item in qa_history]
-        )
-        hint_text = "\n".join(hint_history) if hint_history else "（无）"
-        allow_text = ", ".join(allow_list) if allow_list else "（无）"
-        prompt = (
-            "你是\"海龟汤\"提示生成器。你知道完整真相（仅供内部推理，严禁外泄）。\n"
-            "材料：\n\n"
-            f"* 题面：{puzzle}\n"
-            f"* 完整真相（不可外泄）：{true_answer}\n"
-            f"* 历史问答：{history_text}\n"
-            f"* 历史提示：{hint_text}\n"
-            f"* 允许名词 allow_list：{allow_text}（只能使用其中名词，不得创造新名词）\n\n"
-            "在心中完成：\n\n"
-            "1. 从历史问答归纳：已确认/已否定/不重要/部分正确的信息；\n"
-            "2. 用以下维度整理：对象/身份、关系、动机、时间、地点、证据、步骤、先后、条件、规则、误解；\n"
-            "3. 选择一个“未探索”或“partial 尚缺”的维度，且与历史提示不重复；\n"
-            "4. 只使用 allow_list 中的名词与通用词，生成一句**动作化**的下一步提问方向；\n"
-            "5. 禁止泄露真相细节，不得同义改写泄露；不得复述已确认内容。\n\n"
-            "输出要求（只输出一句）：\n\n"
-            "* 格式：关注【<维度>】：<动词 + allow_list名词/通用词>\n"
-            "* 字数 ≤ 22（或 ≤ 24），不得添加解释。"
+            return "（未配置 LLM，无法提供提示）"
+        return await hints_mod.generate_hint(
+            provider, puzzle, true_answer, qa_history, hint_history, allow_list
         )
 
+    async def _generate_for_storage(self) -> bool:
+        """为存储库生成故事"""
         try:
-            llm_resp: LLMResponse = await provider.text_chat(
-                prompt=prompt,
-                contexts=[],
-                func_tool=None,
-                image_urls=[],
-            )
-            text = llm_resp.completion_text.strip()
-            if text.startswith("提示："):
-                text = text[len("提示："):]
-            return text
+            puzzle, answer = await self.generate_story_with_llm()
+            if puzzle and answer and not puzzle.startswith("（"):
+                self.local_story_storage.add_story(puzzle, answer)
+                logger.info("为存储库生成故事成功")
+                return True
+            else:
+                logger.warning("为存储库生成故事失败")
+                return False
         except Exception as e:
-            logger.error(f"生成提示失败: {e}")
-            return "（生成提示失败，请重试）"
+            logger.error(f"为存储库生成故事错误: {e}")
+            return False
 
+    # ✅ 验证用户推理
+    # ✅ 判断提问的回答方式
+    # ✅ 生成方向性提示
     @filter.command("汤难度")
     async def set_difficulty(self, event: AstrMessageEvent, level: str = ""):
         """设置游戏难度"""

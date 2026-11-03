@@ -170,13 +170,15 @@ def make_plugin(plugin_module):
     """造一个带假 provider 的插件实例。"""
 
     def _make(config=None, judge_text="是"):
+        from astrbot.api.provider import LLMResponse
+
         calls = []
 
         class FakeProvider:
             async def text_chat(self, prompt=None, contexts=None, func_tool=None,
                                 image_urls=None, system_prompt=None, **kwargs):
                 calls.append({"prompt": prompt, "system_prompt": system_prompt})
-                return plugin_module.LLMResponse(completion_text=judge_text)
+                return LLMResponse(completion_text=judge_text)
 
         class FakeContext:
             def __init__(self):
