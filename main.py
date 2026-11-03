@@ -1,6 +1,7 @@
 import json
 import asyncio
 import os
+import re
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -15,6 +16,14 @@ from astrbot.core.utils.session_waiter import (
     SessionFilter,
 )
 from astrbot.api.message_components import At
+
+from .core.jev_transport import JevClient
+from .core import jev_judge
+
+# 预编译：allow_list 每提取一个候选名词就要用一次，放在模块级避免
+# 每次调用都走 re 的模式缓存查找，也免掉首次调用现场编译的卡顿。
+_TOKEN_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]+")
+_TRAILING_UPPER_RE = re.compile(r".*([A-Z])$")
 
 
 # 线程安全的题库管理基类
@@ -82,6 +91,13 @@ class ThreadSafeStoryStorage:
                 "used": len(self.used_indexes),
                 "used_indexes": list(self.used_indexes),
             }
+
+
+# Jev 决策后端
+JUDGE_BACKEND_LLM = "llm"
+JUDGE_BACKEND_JEV = "jev"
+JUDGE_BACKEND_HYBRID = "hybrid"
+JUDGE_BACKENDS = (JUDGE_BACKEND_LLM, JUDGE_BACKEND_JEV, JUDGE_BACKEND_HYBRID)
 
 
 # 游戏状态管理
@@ -459,6 +475,13 @@ class SoupaiPlugin(Star):
         if self.puzzle_source_strategy == "ai_first":
             self.puzzle_source_strategy = "local_first"
 
+        # Jev 决策后端：判断问答走 LLM 还是走 Jev
+        self.judge_backend = str(self.config.get("judge_backend", "llm") or "llm").strip()
+        if self.judge_backend not in JUDGE_BACKENDS:
+            self.judge_backend = JUDGE_BACKEND_LLM
+        self.jev_judge_config = dict(self.config.get("jev_judge", {}) or {})
+        self.jev_client = JevClient()
+
 
         # 难度设置
         self.difficulty_settings = {
@@ -550,6 +573,11 @@ class SoupaiPlugin(Star):
         self.auto_generating = False
         if self.auto_generate_task:
             self.auto_generate_task.cancel()
+        # 关闭 Jev 会话：否则 aiohttp 会留下未关闭的连接器
+        try:
+            await self.jev_client.close()
+        except Exception as e:
+            logger.error(f"关闭 Jev 客户端失败: {e}")
         logger.info("海龟汤插件已卸载呜呜呜呜呜")
 
     async def _start_auto_generate(self):
@@ -947,7 +975,72 @@ class SoupaiPlugin(Star):
             return VerificationResult("验证失败", f"解析验证结果时发生错误: {e}")
 
     # ✅ 判断提问的回答方式
-    async def judge_question(self, question: str, true_answer: str) -> str:
+    async def judge_question(
+        self,
+        question: str,
+        true_answer: str,
+        puzzle: str = "",
+        qa_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        """判断玩家提问的回答方式：是 / 否 / 是也不是 / 不重要。
+
+        按 ``judge_backend`` 分发：
+
+        - ``llm``：走原来的 LLM 判断，行为与接入 Jev 之前完全一致；
+        - ``jev``：走 Jev 决策模型（只计输入 token，不需要 LLM 生成文字）；
+        - ``hybrid``：Jev 先判，置信度不够时再回退 LLM。
+
+        Jev 永远不能把游戏搞坏：Jev 侧任何异常都会回落到 LLM。
+        """
+        if self.judge_backend in (JUDGE_BACKEND_JEV, JUDGE_BACKEND_HYBRID):
+            verdict = await self._judge_via_jev(
+                question, true_answer, puzzle, qa_history
+            )
+            if verdict:
+                return verdict
+        return await self._judge_with_llm(question, true_answer)
+
+    async def _judge_via_jev(
+        self,
+        question: str,
+        true_answer: str,
+        puzzle: str = "",
+        qa_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        """用 Jev 判断玩家提问，返回四档之一；不可用时返回空串（调用方回退 LLM）。"""
+        cfg = self.jev_judge_config
+        if not cfg.get("enabled"):
+            logger.info("Jev 判断未启用，使用 LLM 判断")
+            return ""
+        try:
+            result = await jev_judge.judge_via_jev(
+                self.jev_client,
+                cfg,
+                puzzle,
+                true_answer,
+                question,
+                qa_history,
+                gate_mode=cfg.get("gate_mode") or jev_judge.GATE_MODE_THRESHOLD,
+                min_confidence=cfg.get(
+                    "min_confidence", jev_judge.DEFAULT_MIN_CONFIDENCE
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Jev 判断异常，回退 LLM: {e}")
+            return ""
+
+        if not result.get("ok"):
+            logger.warning(
+                f"Jev 未给出可用判定（{result.get('reason', '未知')}），回退 LLM"
+            )
+            return ""
+        logger.info(
+            f"Jev 判定: {result.get('verdict')} "
+            f"置信度 {result.get('confidence', 0.0):.3f}"
+        )
+        return str(result.get("verdict") or "")
+
+    async def _judge_with_llm(self, question: str, true_answer: str) -> str:
         """使用 LLM 判断用户提问的回答方式"""
 
         # 根据配置获取指定的判断 LLM 提供商
@@ -1011,8 +1104,6 @@ class SoupaiPlugin(Star):
     # ✅ 生成方向性提示
     def build_allow_list(self, puzzle: str, qa_history: List[Dict[str, str]]) -> List[str]:
         """根据题面和历史问答构建允许在提示中出现的名词列表"""
-        import re
-
         # 汇总文本：题面 + 所有问答
         parts = [puzzle] + [
             f"{item.get('question', '')}{item.get('answer', '')}" for item in qa_history
@@ -1020,17 +1111,19 @@ class SoupaiPlugin(Star):
         text = "\n".join(parts)
 
         # 提取连续的中文、字母或数字片段作为候选名词
-        tokens = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", text)
+        tokens = _TOKEN_RE.findall(text)
 
         allow: List[str] = []
+        seen = set()
         for token in tokens:
             if not token:
                 continue
             # 同义合并：例如“男人A”“嫌疑人A”只保留末尾的大写字母
-            m = re.match(r".*([A-Z])$", token)
+            m = _TRAILING_UPPER_RE.match(token)
             if m:
                 token = m.group(1)
-            if token not in allow:
+            if token not in seen:
+                seen.add(token)
                 allow.append(token)
         return allow
 
@@ -1455,9 +1548,14 @@ class SoupaiPlugin(Star):
                     command_part = user_input.strip()  # 直接使用 plain_text
                     logger.info(f"处理游戏问答消息: '{command_part}'")
 
-                    # 使用 LLM 判断回答（是否问答）
-                    logger.info(f"使用 LLM 判断游戏问答: '{command_part}'")
-                    reply = await self.judge_question(command_part, current_answer)
+                    # 判断回答（是否问答）：按 judge_backend 走 LLM 或 Jev
+                    logger.info(f"使用 {self.judge_backend} 判断游戏问答: '{command_part}'")
+                    reply = await self.judge_question(
+                        command_part,
+                        current_answer,
+                        puzzle=(game or {}).get("puzzle", ""),
+                        qa_history=(game or {}).get("qa_history", []),
+                    )
 
                     # 记录提问和回答
                     if game is not None:
@@ -2276,10 +2374,24 @@ class SoupaiPlugin(Star):
         if local_info["available"] <= 0:
             storage_full_warning = "\n⚠️ 本地存储库已满，自动生成已停止"
 
+        judge_backend_names = {
+            JUDGE_BACKEND_LLM: "LLM",
+            JUDGE_BACKEND_JEV: "Jev 决策模型",
+            JUDGE_BACKEND_HYBRID: "Jev 优先（置信度不足回落 LLM）",
+        }
+        jev_enabled = bool((self.jev_judge_config or {}).get("enabled"))
+        jev_line = ""
+        if self.judge_backend != JUDGE_BACKEND_LLM:
+            jev_line = (
+                f"• Jev 决策模型：{'已启用' if jev_enabled else '未启用（将回退 LLM）'}"
+                f"（{self.jev_judge_config.get('base_url') or 'https://jevmodel.org'}）\n"
+            )
         config_info = (
             f"⚙️ 海龟汤插件配置：\n"
             f"• 生成谜题 LLM：{self.generate_llm_provider_id or '默认'}\n"
             f"• 判断问答 LLM：{self.judge_llm_provider_id or '默认'}\n"
+            f"• 判断后端：{judge_backend_names.get(self.judge_backend, self.judge_backend)}\n"
+            f"{jev_line}"
             f"• 游戏超时：{self.game_timeout} 秒\n"
             f"• 网络题库：{online_info['total']} 个谜题 (已用: {online_info['used']}, 剩余: {online_info['available']})\n"
             f"• 本地存储库：{local_info['total']}/{local_info['max_size']} (已用: {local_info['used']}, 剩余: {local_info['remaining']})\n"

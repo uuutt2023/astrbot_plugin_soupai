@@ -1,0 +1,3 @@
+# Jev 决策后端（core/jev_transport.py）用 aiohttp 发请求。
+# AstrBot 本身已依赖 aiohttp，这里显式声明以保证插件独立可用。
+aiohttp>=3.11

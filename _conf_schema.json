@@ -11,6 +11,27 @@
     "hint": "留空则使用系统默认的 LLM 服务商。不建议使用reasoning模型",
     "default": ""
   },
+  "judge_backend": {
+    "description": "判断问答的后端",
+    "type": "string",
+    "hint": "玩家每次提问都要判断一次该回「是/否/是也不是/不重要」。llm＝用 LLM 生成并解析（默认，行为与原来完全一致）；jev＝用 Jev 决策模型做类型化判断，不生成文字，只对输入 token 计费；hybrid＝先用 Jev 判断，置信度不足时再回退 LLM，省 token。",
+    "options": [
+      "llm",
+      "jev",
+      "hybrid"
+    ],
+    "labels": [
+      "LLM 判断（默认）",
+      "Jev 决策模型",
+      "Jev 优先 + LLM 兜底"
+    ],
+    "subtitles": [
+      "维持原样：调用 LLM 生成判断并解析它，行为与接入 Jev 之前完全一致。",
+      "只用 Jev 决策模型判断，不调用大模型；更快也更便宜（Jev 只对输入 token 计费，输出免费），但需要自备 Jev API Key。",
+      "先用 Jev 判断，Jev 把握不大时才调用 LLM 复核；Jev 越不确定，调用 LLM 的频率越高。"
+    ],
+    "default": "llm"
+  },
   "game_timeout": {
     "description": "游戏超时时间（秒）",
     "type": "int",
@@ -46,5 +67,84 @@
       "custom_first",
       "random"
     ]
+  },
+  "jev_judge": {
+    "type": "object",
+    "description": "[Jev 判断] Jev 决策模型设置",
+    "hint": "仅在「判断问答的后端」选择 jev 或 hybrid 时生效。Jev 只对输入 token 计费、输出免费；上游失败不计费，可安全重试。未启用或调用失败时一律回退 LLM，游戏不会中断。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用 Jev 判断",
+        "hint": "总开关。关闭时即使后端选了 jev/hybrid 也只走 LLM。",
+        "default": false
+      },
+      "api_key": {
+        "type": "string",
+        "description": "Jev API Key",
+        "hint": "在所选网关的控制台创建，sk- 开头：jevmodel.org 控制台「API keys」（https://jevmodel.org/zh/docs/），或 TypeSafe（https://console.typesafe.ai）。Key 必须与接口地址属于同一个网关。",
+        "default": ""
+      },
+      "base_url": {
+        "type": "string",
+        "description": "Jev 接口地址",
+        "hint": "实际请求 POST {base_url}/v1/systemone。两个网关请求体完全一致，切换只需改这里并换上对应网关的 Key：https://jevmodel.org（文档见 https://jevmodel.org/zh/docs/）或 https://api.typesafe.ai。",
+        "default": "https://jevmodel.org"
+      },
+      "model": {
+        "type": "string",
+        "description": "Jev 模型名",
+        "hint": "默认 jev-latest；jev-preview 支持图像输入与 Box 定位（实验性）。",
+        "default": "jev-latest"
+      },
+      "timeout_sec": {
+        "type": "float",
+        "description": "请求超时（秒）",
+        "hint": "本轮全部尝试共享的总预算，同时也是等待上限。单次 Jev 调用通常需要 2-4 秒，预算低于 5 秒会一直超时。建议 5-10 秒。",
+        "default": 8.0
+      },
+      "retries": {
+        "type": "int",
+        "description": "失败重试次数",
+        "hint": "限流／上游故障（429/502/409）重试次数，退避等待装不进本轮预算时放弃。",
+        "default": 1
+      },
+      "gate_mode": {
+        "type": "string",
+        "description": "置信度门控方式",
+        "hint": "决定「什么时候才采信 Jev 的判断」。threshold＝Jev 对自己这一档的把握达到阈值才采信，否则回退 LLM（默认，行为可复现、成本可预期）；sample＝以把握概率 p 采信 Jev，否则回退 LLM——Jev 越没把握，调用 LLM 的频率越高，成本随不确定性平滑上升。",
+        "options": [
+          "threshold",
+          "sample"
+        ],
+        "labels": [
+          "按阈值（可复现）",
+          "按概率抽样（平滑）"
+        ],
+        "subtitles": [
+          "Jev 对自己这一档的把握达到阈值才采信，否则回退 LLM；同样的输入永远得到同样的处理，LLM 调用次数可预期。",
+          "以 Jev 给出的把握概率 p 采信 Jev，否则回退 LLM；LLM 调用频率随 Jev 的不确定性线性上升，抽样值会写进日志。"
+        ],
+        "default": "threshold"
+      },
+      "min_confidence": {
+        "type": "float",
+        "description": "采信阈值",
+        "hint": "threshold 模式下：Jev 选中的那一档概率达到该值才采信，否则回退 LLM。默认值：0.6。sample 模式下这个值不参与判定，只在界面上留作参考。",
+        "default": 0.6
+      },
+      "max_state_chars": {
+        "type": "int",
+        "description": "发送上下文长度上限",
+        "hint": "发送给 Jev 的上下文（题面 + 完整真相 + 最近几轮问答 + 玩家提问）字符数上限，超出时从最旧的历史问答开始丢。默认值：1200。",
+        "default": 1200
+      },
+      "history_rounds": {
+        "type": "int",
+        "description": "带入的历史轮数",
+        "hint": "最多带入最近几轮问答供 Jev 参考（判断「不重要」时用得上）。超出长度上限时优先丢最旧的。默认值：6。",
+        "default": 6
+      }
+    }
   }
-} 
+}
