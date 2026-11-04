@@ -10,10 +10,10 @@
 
 用法
 ----
-    export JEVMODEL_API_KEY=sk-xxxx
+    export JEV_GATEWAY_URL=http://127.0.0.1:8770
     python scripts/eval_judgment.py                 # 跑全部用例
     python scripts/eval_judgment.py --compare       # 额外对比「带/不带历史」
-    python scripts/eval_judgment.py --base-url https://jevmodel.org
+    python scripts/eval_judgment.py --gateway http://127.0.0.1:8770
 
 用例里的预期判定是人工标注的；判定准确率低于 --threshold（默认 0.9）时退出码非 0，
 方便挂到 CI 上。
@@ -153,22 +153,24 @@ async def run_case(client: JevClient, cfg: Dict[str, Any], case: Case, use_histo
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="海龟汤问答判定离线评测")
-    parser.add_argument("--base-url", default=os.environ.get("JEVMODEL_BASE_URL", "https://jevmodel.org"))
-    parser.add_argument("--model", default=os.environ.get("JEVMODEL_MODEL", "jev-latest"))
-    parser.add_argument("--api-key", default=os.environ.get("JEVMODEL_API_KEY", ""))
+    parser.add_argument(
+        "--gateway",
+        default=os.environ.get("JEV_GATEWAY_URL", "http://127.0.0.1:8770"),
+        help="Jev 决策网关地址",
+    )
+    parser.add_argument(
+        "--protocol",
+        default=os.environ.get("JEV_GATEWAY_PROTOCOL", "systemone"),
+        help="网关里登记的协议名",
+    )
     parser.add_argument("--threshold", type=float, default=0.9, help="判定准确率下限")
     parser.add_argument("--compare", action="store_true", help="额外对比带/不带历史")
     parser.add_argument("--language", default=jev_judge.LANG_AUTO, choices=list(jev_judge.LANGUAGES))
     args = parser.parse_args()
 
-    if not args.api_key:
-        print("✗ 缺少 API Key：请设置环境变量 JEVMODEL_API_KEY")
-        return 2
-
     cfg = {
-        "api_key": args.api_key,
-        "base_url": args.base_url,
-        "model": args.model,
+        "proxy_url": args.gateway,
+        "proxy_protocol": args.protocol,
         "timeout_sec": 20,
         "max_state_chars": jev_judge.DEFAULT_MAX_STATE_CHARS,
         "history_rounds": jev_judge.DEFAULT_HISTORY_ROUNDS,
@@ -177,7 +179,10 @@ async def main() -> int:
 
     client = JevClient()
     print("=" * 78)
-    print(f"问答判定评测 · 模型 {args.model} · 提示词 {jev_judge.PROMPT_VERSION} · 语言 {args.language}")
+    print(
+        f"问答判定评测 · 网关 {args.gateway}（协议 {args.protocol}）"
+        f" · 提示词 {jev_judge.PROMPT_VERSION} · 语言 {args.language}"
+    )
     print("=" * 78)
 
     hits = 0

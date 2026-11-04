@@ -1595,13 +1595,12 @@ class SoupaiPlugin(Star):
             )
             language_names = {"zh": "中文", "en": "英文"}
             proxy_url = str(self.jev_judge_config.get("proxy_url") or "").strip()
-            if proxy_url:
-                target = (
-                    f"{proxy_url} · 协议 "
-                    f"{self.jev_judge_config.get('proxy_protocol') or 'systemone'}"
-                )
-            else:
-                target = self.jev_judge_config.get("base_url") or "https://jevmodel.org"
+            target = (
+                f"{proxy_url} · 协议 "
+                f"{self.jev_judge_config.get('proxy_protocol') or 'systemone'}"
+                if proxy_url
+                else "未配置网关"
+            )
             jev_line = (
                 f"• Jev 决策模型：{'已启用' if jev_enabled else '未启用（将回退 LLM）'}"
                 f"（{target}）\n"
