@@ -1594,9 +1594,17 @@ class SoupaiPlugin(Star):
                 self.jev_judge_config.get("prompt_language"), "", "", ""
             )
             language_names = {"zh": "中文", "en": "英文"}
+            proxy_url = str(self.jev_judge_config.get("proxy_url") or "").strip()
+            if proxy_url:
+                target = (
+                    f"{proxy_url} · 协议 "
+                    f"{self.jev_judge_config.get('proxy_protocol') or 'systemone'}"
+                )
+            else:
+                target = self.jev_judge_config.get("base_url") or "https://jevmodel.org"
             jev_line = (
                 f"• Jev 决策模型：{'已启用' if jev_enabled else '未启用（将回退 LLM）'}"
-                f"（{self.jev_judge_config.get('base_url') or 'https://jevmodel.org'}）\n"
+                f"（{target}）\n"
                 f"• Jev 提示词：{jev_judge.PROMPT_VERSION}"
                 f"（语言 {language_names.get(language, language)}）\n"
             )
