@@ -134,21 +134,23 @@ def resolve_language(preferred: Any, *texts: Any) -> str:
     return pref
 
 
-def build_questions(language: str = LANG_ZH) -> Dict[str, Dict[str, Any]]:
-    """构造 Jev 请求的问题集合（单道 choice 题，落在文档的 8 道上限内）。"""
+def build_questions(language: str = LANG_ZH, prompt: str = "") -> Dict[str, Dict[str, Any]]:
+    """构造 Jev 请求的问题集合（单道 choice 题，落在文档的 8 道上限内）。
+
+    prompt 非空时替换 instructions；选项集（criteria）保持内置。
+    """
+    custom = (prompt or "").strip()
     if language == LANG_EN:
-        return {
-            QUESTION_NAME: {
-                "type": "choice",
-                "instructions": jev_prompts.INSTRUCTIONS_EN,
-                "criteria": dict(jev_prompts.CRITERIA_EN),
-            }
-        }
+        instructions = custom or jev_prompts.INSTRUCTIONS_EN
+        criteria = jev_prompts.CRITERIA_EN
+    else:
+        instructions = custom or jev_prompts.INSTRUCTIONS_ZH
+        criteria = jev_prompts.CRITERIA_ZH
     return {
         QUESTION_NAME: {
             "type": "choice",
-            "instructions": jev_prompts.INSTRUCTIONS_ZH,
-            "criteria": dict(jev_prompts.CRITERIA_ZH),
+            "instructions": instructions,
+            "criteria": dict(criteria),
         }
     }
 
@@ -387,7 +389,9 @@ async def judge_via_jev(
         history_rounds=int(cfg.get("history_rounds") or DEFAULT_HISTORY_ROUNDS),
         language=language,
     )
-    result = await client.evaluate(cfg, state, build_questions(language))
+    result = await client.evaluate(
+        cfg, state, build_questions(language, str(cfg.get("prompt") or ""))
+    )
     status = str(result.get("status") or "")
     if status != "ready":
         return {

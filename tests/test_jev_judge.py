@@ -478,3 +478,33 @@ class TestDecisionProcedure:
                 jev_judge.QUESTION_NAME
             ]["criteria"]
             assert len(criteria) == 3
+
+
+class TestCustomPrompt:
+    """Jev 提示词可以自己改。"""
+
+    def test_default_prompt_used_when_empty(self):
+        from astrbot_plugin_soupai.core import jev_judge
+        from astrbot_plugin_soupai.prompts import jev as jev_prompts
+
+        for lang, expected in (
+            (jev_judge.LANG_ZH, jev_prompts.INSTRUCTIONS_ZH),
+            (jev_judge.LANG_EN, jev_prompts.INSTRUCTIONS_EN),
+        ):
+            got = jev_judge.build_questions(lang)[jev_judge.QUESTION_NAME]["instructions"]
+            assert got == expected
+
+    def test_custom_prompt_replaces_instructions(self):
+        from astrbot_plugin_soupai.core import jev_judge
+
+        question = jev_judge.build_questions(jev_judge.LANG_ZH, "  这是自定义提示词  ")
+        name = jev_judge.QUESTION_NAME
+        assert question[name]["instructions"] == "这是自定义提示词"
+        # 选项集不受影响
+        assert question[name]["criteria"]
+
+    def test_custom_prompt_works_for_english_too(self):
+        from astrbot_plugin_soupai.core import jev_judge
+
+        question = jev_judge.build_questions(jev_judge.LANG_EN, "custom")
+        assert question[jev_judge.QUESTION_NAME]["instructions"] == "custom"

@@ -151,6 +151,14 @@
         "description": "带入的历史轮数",
         "hint": "最多带入最近几轮问答供 Jev 参考。",
         "default": 6
+      },
+      "prompt": {
+        "type": "text",
+        "description": "Jev 提示词",
+        "hint": "留空＝用内置提示词。改这里就是改问 Jev 的话。",
+        "editor_mode": true,
+        "editor_language": "markdown",
+        "default": ""
       }
     }
   }
